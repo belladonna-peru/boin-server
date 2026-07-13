@@ -8,15 +8,41 @@ const server = http.createServer((req, res) => {
 
 const io = new Server(server, { cors: { origin: '*' } });
 
-io.on('connection', (socket) => {
-  console.log('pata conectado:', socket.id);
+// Lista de patas conectados: { socketId: { id, n } }
+const patas = {};
 
-  // Recibe la ubi de un celular y la reenvía a todos los demás
+function avisarPatas() {
+  io.emit('patas', Object.values(patas));
+}
+
+io.on('connection', (socket) => {
+  // Un celular se presenta con su id y nombre
+  socket.on('hola', (data) => {
+    if (!data || !data.id) return;
+    patas[socket.id] = { id: data.id, n: data.n || 'Pata' };
+    avisarPatas();
+  });
+
+  // Ubicación en tiempo real (igual que antes)
   socket.on('ubi', (data) => {
     socket.broadcast.emit('ubi', data);
   });
 
-  socket.on('disconnect', () => console.log('pata desconectado:', socket.id));
+  // Chat: reenvía el mensaje a todos (cada celular filtra los suyos)
+  socket.on('chat', (msg) => {
+    if (!msg || !msg.de || !msg.para) return;
+    io.emit('chat', { ...msg, ts: Date.now() });
+  });
+
+  // Aviso de "escribiendo..."
+  socket.on('escribiendo', (data) => {
+    socket.broadcast.emit('escribiendo', data);
+  });
+
+  socket.on('disconnect', () => {
+    delete patas[socket.id];
+    avisarPatas();
+  });
 });
 
 const PORT = process.env.PORT || 3000;
