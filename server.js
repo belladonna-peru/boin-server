@@ -32,6 +32,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS feat_votos ( feat TEXT, de TEXT, PRIMARY KEY (feat, de) );
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS leido BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS bloqueos ( de TEXT, a TEXT, PRIMARY KEY (de, a) );
+    CREATE TABLE IF NOT EXISTS dias_activos ( uid TEXT, dia TEXT, PRIMARY KEY (uid, dia) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -48,6 +49,10 @@ function sendTo(userId, event, payload) {
 async function nombreDe(id) {
   const r = await pool.query(`SELECT n FROM usuarios WHERE id=$1`, [id]);
   return r.rowCount ? r.rows[0].n : 'Pata';
+}
+function diaHoy() {
+  // Día calendario de Perú (UTC-5)
+  return new Date(Date.now() - 5 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
 async function gruposDe(id) {
@@ -173,6 +178,7 @@ io.on('connection', (socket) => {
       online[d.id] = online[d.id] || new Set();
       online[d.id].add(socket.id);
       socketDe[socket.id] = d.id;
+      await pool.query(`INSERT INTO dias_activos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [d.id, diaHoy()]);
       await avisarEstado(d.id);
       await avisarAmigos(d.id);
     } catch (e) { console.log('hola error', e.message); }
@@ -239,6 +245,36 @@ io.on('connection', (socket) => {
       }
       await avisarEstado(yo);
     } catch (e) { console.log('compartir error', e.message); }
+  });
+
+  socket.on('diario', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      // Racha: días consecutivos hasta hoy
+      const dias = await pool.query(
+        `SELECT dia FROM dias_activos WHERE uid=$1 ORDER BY dia DESC LIMIT 60`, [yo]);
+      const set = new Set(dias.rows.map(x => x.dia));
+      let racha = 0;
+      let cursor = new Date(Date.now() - 5 * 3600 * 1000);
+      while (set.has(cursor.toISOString().slice(0, 10))) {
+        racha++;
+        cursor = new Date(cursor.getTime() - 24 * 3600 * 1000);
+      }
+      // Misiones de HOY (verificadas contra la base)
+      const inicioHoy = new Date(diaHoy() + 'T05:00:00Z').getTime();
+      const m1 = await pool.query(`SELECT 1 FROM momentos WHERE de=$1 AND ts>=$2 LIMIT 1`, [yo, inicioHoy]);
+      const m2 = await pool.query(`SELECT 1 FROM mensajes WHERE de=$1 AND ts>=$2 LIMIT 1`, [yo, inicioHoy]);
+      const m3 = await pool.query(`SELECT 1 FROM comentarios WHERE de=$1 AND ts>=$2 LIMIT 1`, [yo, inicioHoy]);
+      socket.emit('diario', {
+        racha,
+        misiones: [
+          { t: '📸 Publica un momento', done: !!m1.rowCount },
+          { t: '💬 Escríbele a un pata', done: !!m2.rowCount },
+          { t: '🗨️ Comenta un momento', done: !!m3.rowCount },
+        ],
+      });
+    } catch (e) { console.log('diario error', e.message); }
   });
 
   socket.on('ubi', async (data) => {
