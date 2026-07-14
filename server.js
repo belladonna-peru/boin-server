@@ -9,24 +9,19 @@ const pool = new Pool({
 
 async function initDb() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS usuarios (
-      id TEXT PRIMARY KEY, n TEXT, usuario TEXT, num TEXT
-    );
+    CREATE TABLE IF NOT EXISTS usuarios ( id TEXT PRIMARY KEY, n TEXT, usuario TEXT, num TEXT );
     CREATE TABLE IF NOT EXISTS amistades ( a TEXT, b TEXT, PRIMARY KEY (a, b) );
     CREATE TABLE IF NOT EXISTS solicitudes ( de TEXT, para TEXT, PRIMARY KEY (de, para) );
     CREATE TABLE IF NOT EXISTS comparto ( de TEXT, con TEXT, PRIMARY KEY (de, con) );
-    CREATE TABLE IF NOT EXISTS mensajes (
-      id SERIAL PRIMARY KEY, de TEXT, para TEXT, texto TEXT, ts BIGINT
-    );
-    CREATE TABLE IF NOT EXISTS momentos (
-      id SERIAL PRIMARY KEY, de TEXT, texto TEXT, color INT DEFAULT 0, ts BIGINT
-    );
+    CREATE TABLE IF NOT EXISTS mensajes ( id SERIAL PRIMARY KEY, de TEXT, para TEXT, texto TEXT, ts BIGINT );
+    CREATE TABLE IF NOT EXISTS momentos ( id SERIAL PRIMARY KEY, de TEXT, texto TEXT, color INT DEFAULT 0, ts BIGINT );
     CREATE TABLE IF NOT EXISTS likes ( momento_id INT, de TEXT, PRIMARY KEY (momento_id, de) );
     ALTER TABLE momentos ADD COLUMN IF NOT EXISTS foto TEXT;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';
-    CREATE TABLE IF NOT EXISTS notifs (
-      id SERIAL PRIMARY KEY, para TEXT, tipo TEXT, texto TEXT, ts BIGINT, leida BOOLEAN DEFAULT FALSE
-    );
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'personal';
+    CREATE TABLE IF NOT EXISTS notifs ( id SERIAL PRIMARY KEY, para TEXT, tipo TEXT, texto TEXT, ts BIGINT, leida BOOLEAN DEFAULT FALSE );
+    CREATE TABLE IF NOT EXISTS negocios ( id TEXT PRIMARY KEY, nombre TEXT, descr TEXT, cat TEXT );
+    CREATE TABLE IF NOT EXISTS productos ( id SERIAL PRIMARY KEY, negocio TEXT, nombre TEXT, precio NUMERIC );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -59,6 +54,13 @@ async function repartirUbi(yo, lat, lng) {
   r.rows.forEach(row => sendTo(row.con, 'ubi', { lat, lng, id: yo, n }));
 }
 
+async function puedenChatear(a, b) {
+  const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [a, b]);
+  if (am.rowCount) return true;
+  const biz = await pool.query(`SELECT 1 FROM usuarios WHERE (id=$1 OR id=$2) AND tipo='business'`, [a, b]);
+  return !!biz.rowCount;
+}
+
 async function estadoDe(id) {
   const am = await pool.query(
     `SELECT u.id, u.n, u.usuario,
@@ -66,8 +68,33 @@ async function estadoDe(id) {
      FROM amistades a JOIN usuarios u ON u.id=a.b WHERE a.a=$1`, [id]);
   const so = await pool.query(
     `SELECT s.de, u.n AS den, u.usuario FROM solicitudes s JOIN usuarios u ON u.id=s.de WHERE s.para=$1`, [id]);
+  // Contactos de pedidos (chats con negocios o clientes que no son amigos)
+  const pe = await pool.query(
+    `SELECT DISTINCT cid FROM (
+       SELECT CASE WHEN m.de=$1 THEN m.para ELSE m.de END AS cid FROM mensajes m WHERE m.de=$1 OR m.para=$1
+     ) x
+     WHERE cid<>$1 AND NOT EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=cid)`, [id]);
+  const extras = [];
+  for (const row of pe.rows) {
+    const u = await pool.query(
+      `SELECT u.n, u.usuario, u.tipo, ng.nombre AS bizn FROM usuarios u
+       LEFT JOIN negocios ng ON ng.id=u.id WHERE u.id=$1`, [row.cid]);
+    if (u.rowCount) {
+      extras.push({
+        id: row.cid,
+        n: u.rows[0].bizn || u.rows[0].n,
+        usuario: u.rows[0].usuario,
+        online: !!(online[row.cid] && online[row.cid].size),
+        leComparto: false,
+        biz: u.rows[0].tipo === 'business',
+      });
+    }
+  }
   return {
-    amigos: am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto })),
+    amigos: [
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto })),
+      ...extras,
+    ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario })),
   };
 }
@@ -91,7 +118,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Boin server OK 🧡 v7 activity');
+  res.end('Boin server OK 🧡 v8 mercado');
 });
 io.attach(server);
 
@@ -187,8 +214,10 @@ io.on('connection', (socket) => {
     try {
       const yo = socketDe[socket.id];
       if (!yo || !msg || !msg.para || !msg.texto) return;
-      const ok = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, msg.para]);
-      if (!ok.rowCount) { socket.emit('aviso', 'Primero deben ser patas: envíale una solicitud 🤝'); return; }
+      if (!(await puedenChatear(yo, msg.para))) {
+        socket.emit('aviso', 'Primero deben ser patas: envíale una solicitud 🤝');
+        return;
+      }
       const ts = Date.now();
       await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, msg.para, msg.texto, ts]);
       const m = { de: yo, para: msg.para, texto: msg.texto, ts };
@@ -263,7 +292,6 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('like error', e.message); }
   });
 
-  // ===== ACTIVITY =====
   socket.on('notifs', async () => {
     try {
       const yo = socketDe[socket.id];
@@ -277,17 +305,15 @@ io.on('connection', (socket) => {
   socket.on('notifs-leer', async () => {
     try {
       const yo = socketDe[socket.id];
-      if (!yo) return;
-      await pool.query(`UPDATE notifs SET leida=TRUE WHERE para=$1`, [yo]);
+      if (yo) await pool.query(`UPDATE notifs SET leida=TRUE WHERE para=$1`, [yo]);
     } catch (e) {}
   });
 
-  // ===== PERFIL =====
   socket.on('perfil', async () => {
     try {
       const yo = socketDe[socket.id];
       if (!yo) return;
-      const u = await pool.query(`SELECT n, usuario, bio FROM usuarios WHERE id=$1`, [yo]);
+      const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
       const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
       const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
       const li = await pool.query(
@@ -296,6 +322,7 @@ io.on('connection', (socket) => {
         n: u.rows[0] ? u.rows[0].n : 'Pata',
         usuario: u.rows[0] ? u.rows[0].usuario : '',
         bio: u.rows[0] ? (u.rows[0].bio || '') : '',
+        tipo: u.rows[0] ? (u.rows[0].tipo || 'personal') : 'personal',
         patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
       });
     } catch (e) { console.log('perfil error', e.message); }
@@ -308,6 +335,109 @@ io.on('connection', (socket) => {
       await pool.query(`UPDATE usuarios SET bio=$2 WHERE id=$1`, [yo, String(d.texto || '').slice(0, 120)]);
       socket.emit('aviso', 'Descripción actualizada ✏️');
     } catch (e) {}
+  });
+
+  // ===== MERCADO / BUSINESS =====
+
+  socket.on('biz-crear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.nombre) return;
+      await pool.query(`UPDATE usuarios SET tipo='business' WHERE id=$1`, [yo]);
+      await pool.query(
+        `INSERT INTO negocios (id,nombre,descr,cat) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (id) DO UPDATE SET nombre=$2, descr=$3, cat=$4`,
+        [yo, String(d.nombre).slice(0, 40), String(d.descr || '').slice(0, 120), d.cat || 'tienda']);
+      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
+      socket.emit('biz-mio', { negocio: n.rows[0], productos: [] });
+      // Perfil fresco YA con tipo business (evita que la app regrese a personal)
+      const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
+      const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
+      const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
+      const li = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
+      socket.emit('perfil', {
+        n: u.rows[0].n, usuario: u.rows[0].usuario, bio: u.rows[0].bio || '',
+        tipo: u.rows[0].tipo || 'business',
+        patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
+      });
+      socket.emit('aviso', '🎉 ¡Tu negocio está en el Mercado de Boin!');
+    } catch (e) { console.log('biz-crear error', e.message); }
+  });
+
+  socket.on('biz-mio', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
+      if (!n.rowCount) { socket.emit('biz-mio', { negocio: null, productos: [] }); return; }
+      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
+      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+    } catch (e) { console.log('biz-mio error', e.message); }
+  });
+
+  socket.on('producto-agregar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.nombre || !d.precio) return;
+      const biz = await pool.query(`SELECT 1 FROM negocios WHERE id=$1`, [yo]);
+      if (!biz.rowCount) return;
+      await pool.query(`INSERT INTO productos (negocio,nombre,precio) VALUES ($1,$2,$3)`,
+        [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0)]);
+      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
+      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
+      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+    } catch (e) { console.log('producto error', e.message); }
+  });
+
+  socket.on('producto-borrar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`DELETE FROM productos WHERE id=$1 AND negocio=$2`, [d.id, yo]);
+      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
+      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
+      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+    } catch (e) {}
+  });
+
+  socket.on('negocios', async () => {
+    try {
+      const r = await pool.query(
+        `SELECT n.id, n.nombre, n.descr, n.cat,
+           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
+         FROM negocios n ORDER BY n.nombre`);
+      socket.emit('negocios', r.rows.map(x => ({ ...x, online: !!(online[x.id] && online[x.id].size) })));
+    } catch (e) { console.log('negocios error', e.message); }
+  });
+
+  socket.on('tienda', async (d) => {
+    try {
+      if (!d || !d.id) return;
+      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [d.id]);
+      if (!n.rowCount) return;
+      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [d.id]);
+      socket.emit('tienda', { negocio: n.rows[0], productos: p.rows });
+    } catch (e) { console.log('tienda error', e.message); }
+  });
+
+  socket.on('pedido', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.negocio || !d.items || !d.items.length) return;
+      const total = d.items.reduce((a, it) => a + (Number(it.precio) || 0) * (it.cant || 1), 0);
+      const lineas = d.items.map(it => it.cant + 'x ' + it.nombre).join(', ');
+      const texto = '🛍️ PEDIDO: ' + lineas + ' — Total S/ ' + total.toFixed(2);
+      const ts = Date.now();
+      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, d.negocio, texto, ts]);
+      const m = { de: yo, para: d.negocio, texto, ts };
+      sendTo(d.negocio, 'chat', m);
+      sendTo(yo, 'chat', m);
+      await crearNotif(d.negocio, 'pedido', '🛍️ Nuevo pedido de ' + (await nombreDe(yo)) + ' — S/ ' + total.toFixed(2));
+      await avisarEstado(yo);
+      await avisarEstado(d.negocio);
+      socket.emit('aviso', '✅ Pedido enviado: coordina el pago (Yape) y la entrega en el Chat');
+    } catch (e) { console.log('pedido error', e.message); }
   });
 
   socket.on('escribiendo', (d) => {
@@ -326,5 +456,5 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-initDb().then(() => server.listen(PORT, () => console.log('Boin server v7 en puerto', PORT)))
+initDb().then(() => server.listen(PORT, () => console.log('Boin server v8 en puerto', PORT)))
   .catch(e => { console.log('Error de base de datos:', e.message); server.listen(PORT); });
