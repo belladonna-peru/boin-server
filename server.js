@@ -17,14 +17,16 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS momentos ( id SERIAL PRIMARY KEY, de TEXT, texto TEXT, color INT DEFAULT 0, ts BIGINT );
     CREATE TABLE IF NOT EXISTS likes ( momento_id INT, de TEXT, PRIMARY KEY (momento_id, de) );
     ALTER TABLE momentos ADD COLUMN IF NOT EXISTS foto TEXT;
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'personal';
     CREATE TABLE IF NOT EXISTS notifs ( id SERIAL PRIMARY KEY, para TEXT, tipo TEXT, texto TEXT, ts BIGINT, leida BOOLEAN DEFAULT FALSE );
     CREATE TABLE IF NOT EXISTS negocios ( id TEXT PRIMARY KEY, nombre TEXT, descr TEXT, cat TEXT );
-    CREATE TABLE IF NOT EXISTS productos ( id SERIAL PRIMARY KEY, negocio TEXT, nombre TEXT, precio NUMERIC );
-    CREATE TABLE IF NOT EXISTS comentarios ( id SERIAL PRIMARY KEY, momento_id INT, de TEXT, texto TEXT, padre INT, ts BIGINT );
     ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
     ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+    CREATE TABLE IF NOT EXISTS productos ( id SERIAL PRIMARY KEY, negocio TEXT, nombre TEXT, precio NUMERIC );
+    CREATE TABLE IF NOT EXISTS comentarios ( id SERIAL PRIMARY KEY, momento_id INT, de TEXT, texto TEXT, padre INT, ts BIGINT );
     CREATE TABLE IF NOT EXISTS grupos ( id SERIAL PRIMARY KEY, nombre TEXT, creador TEXT, ts BIGINT );
     CREATE TABLE IF NOT EXISTS grupo_miembros ( grupo INT, uid TEXT, PRIMARY KEY (grupo, uid) );
     CREATE TABLE IF NOT EXISTS mensajes_grupo ( id SERIAL PRIMARY KEY, grupo INT, de TEXT, texto TEXT, ts BIGINT );
@@ -33,16 +35,15 @@ async function initDb() {
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS leido BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS bloqueos ( de TEXT, a TEXT, PRIMARY KEY (de, a) );
     CREATE TABLE IF NOT EXISTS dias_activos ( uid TEXT, dia TEXT, PRIMARY KEY (uid, dia) );
-    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
-    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+    CREATE TABLE IF NOT EXISTS wallet_mov ( id SERIAL PRIMARY KEY, uid TEXT, tipo TEXT, monto NUMERIC, detalle TEXT, ts BIGINT );
   `);
   console.log('Base de datos lista ✅');
 }
 
 const io = new Server(undefined, { cors: { origin: '*' } });
 const online = {};
-const ubiCache = {}; // última ubi conocida de cada usuario conectado (solo en memoria)
 const socketDe = {};
+const ubiCache = {};
 
 function sendTo(userId, event, payload) {
   const set = online[userId];
@@ -53,8 +54,8 @@ async function nombreDe(id) {
   const r = await pool.query(`SELECT n FROM usuarios WHERE id=$1`, [id]);
   return r.rowCount ? r.rows[0].n : 'Pata';
 }
+
 function diaHoy() {
-  // Día calendario de Perú (UTC-5)
   return new Date(Date.now() - 5 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
@@ -82,17 +83,18 @@ async function repartirUbi(yo, lat, lng) {
   r.rows.forEach(row => sendTo(row.con, 'ubi', { lat, lng, id: yo, n }));
 }
 
+async function hayBloqueo(a, b) {
+  const r = await pool.query(
+    `SELECT 1 FROM bloqueos WHERE (de=$1 AND a=$2) OR (de=$2 AND a=$1)`, [a, b]);
+  return !!r.rowCount;
+}
+
 async function puedenChatear(a, b) {
   if (await hayBloqueo(a, b)) return false;
   const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [a, b]);
   if (am.rowCount) return true;
   const biz = await pool.query(`SELECT 1 FROM usuarios WHERE (id=$1 OR id=$2) AND tipo='business'`, [a, b]);
   return !!biz.rowCount;
-}
-async function hayBloqueo(a, b) {
-  const r = await pool.query(
-    `SELECT 1 FROM bloqueos WHERE (de=$1 AND a=$2) OR (de=$2 AND a=$1)`, [a, b]);
-  return !!r.rowCount;
 }
 
 async function estadoDe(id) {
@@ -128,7 +130,7 @@ async function estadoDe(id) {
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, noLeidos: r.noleidos, meComparte: r.mecomparte, })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, noLeidos: r.noleidos })),
       ...extras,
     ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario })),
@@ -138,6 +140,41 @@ async function avisarEstado(id) { sendTo(id, 'estado', await estadoDe(id)); }
 async function avisarAmigos(id) {
   const r = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [id]);
   for (const row of r.rows) await avisarEstado(row.b);
+}
+
+async function perfilDe(yo) {
+  const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
+  const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
+  const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
+  const li = await pool.query(
+    `SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
+  return {
+    n: u.rows[0] ? u.rows[0].n : 'Pata',
+    usuario: u.rows[0] ? u.rows[0].usuario : '',
+    bio: u.rows[0] ? (u.rows[0].bio || '') : '',
+    tipo: u.rows[0] ? (u.rows[0].tipo || 'personal') : 'personal',
+    patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
+  };
+}
+
+async function saldoDe(yo) {
+  const r = await pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN tipo IN ('recarga','recibido') THEN monto ELSE -monto END),0)::float AS s
+     FROM wallet_mov WHERE uid=$1`, [yo]);
+  return r.rows[0].s;
+}
+
+async function walletDe(yo) {
+  const movs = await pool.query(
+    `SELECT tipo, monto::float, detalle, ts FROM wallet_mov WHERE uid=$1 ORDER BY ts DESC LIMIT 30`, [yo]);
+  return { saldo: await saldoDe(yo), movs: movs.rows.map(x => ({ ...x, ts: Number(x.ts) })) };
+}
+
+async function bizMio(yo) {
+  const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
+  if (!n.rowCount) return { negocio: null, productos: [] };
+  const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
+  return { negocio: n.rows[0], productos: p.rows };
 }
 
 const FEATS = ['llamadas', 'wallet', 'streamer', 'mascotas'];
@@ -166,27 +203,11 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Boin server OK 🧡 v9 boin');
+  res.end('Boin server OK 🧡 v10 wallet+panel');
 });
 io.attach(server);
 
 io.on('connection', (socket) => {
-  socket.on('zonas', () => {
-    try {
-      const ahora = Date.now();
-      const celdas = {};
-      Object.values(ubiCache).forEach(u => {
-        if (ahora - u.ts > 120000) return; // solo ubis de los últimos 2 min
-        const k = Math.round(u.lat / 0.003) + '_' + Math.round(u.lng / 0.003); // celdas de ~330 m
-        celdas[k] = celdas[k] || { lat: 0, lng: 0, n: 0 };
-        celdas[k].lat += u.lat; celdas[k].lng += u.lng; celdas[k].n++;
-      });
-      const zonas = Object.values(celdas)
-        .filter(c => c.n >= 2) // mínimo 2 personas para marcar zona (anonimato)
-        .map(c => ({ lat: c.lat / c.n, lng: c.lng / c.n, n: c.n }));
-      socket.emit('zonas', zonas);
-    } catch (e) {}
-  });
 
   socket.on('hola', async (d) => {
     try {
@@ -268,11 +289,65 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('compartir error', e.message); }
   });
 
+  socket.on('amistad-quitar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
+      sendTo(d.id, 'ubi-off', { id: yo });
+      sendTo(yo, 'ubi-off', { id: d.id });
+      await avisarEstado(yo);
+      await avisarEstado(d.id);
+      socket.emit('aviso', '💔 Dejaron de ser patas (y de compartir ubi)');
+    } catch (e) { console.log('quitar error', e.message); }
+  });
+
+  socket.on('bloquear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`INSERT INTO bloqueos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [yo, d.id]);
+      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM solicitudes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.id]);
+      sendTo(d.id, 'ubi-off', { id: yo });
+      sendTo(yo, 'ubi-off', { id: d.id });
+      await avisarEstado(yo);
+      await avisarEstado(d.id);
+      socket.emit('aviso', '⛔ Usuario bloqueado: no podrá verte, escribirte ni enviarte solicitudes');
+    } catch (e) { console.log('bloquear error', e.message); }
+  });
+
+  socket.on('ubi', async (data) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !data) return;
+      await repartirUbi(yo, data.lat, data.lng);
+    } catch (e) { console.log('ubi error', e.message); }
+  });
+
+  socket.on('zonas', () => {
+    try {
+      const ahora = Date.now();
+      const celdas = {};
+      Object.values(ubiCache).forEach(u => {
+        if (ahora - u.ts > 120000) return;
+        const k = Math.round(u.lat / 0.003) + '_' + Math.round(u.lng / 0.003);
+        celdas[k] = celdas[k] || { lat: 0, lng: 0, n: 0 };
+        celdas[k].lat += u.lat; celdas[k].lng += u.lng; celdas[k].n++;
+      });
+      const zonas = Object.values(celdas)
+        .filter(c => c.n >= 2)
+        .map(c => ({ lat: c.lat / c.n, lng: c.lng / c.n, n: c.n }));
+      socket.emit('zonas', zonas);
+    } catch (e) {}
+  });
+
   socket.on('diario', async () => {
     try {
       const yo = socketDe[socket.id];
       if (!yo) return;
-      // Racha: días consecutivos hasta hoy
       const dias = await pool.query(
         `SELECT dia FROM dias_activos WHERE uid=$1 ORDER BY dia DESC LIMIT 60`, [yo]);
       const set = new Set(dias.rows.map(x => x.dia));
@@ -282,7 +357,6 @@ io.on('connection', (socket) => {
         racha++;
         cursor = new Date(cursor.getTime() - 24 * 3600 * 1000);
       }
-      // Misiones de HOY (verificadas contra la base)
       const inicioHoy = new Date(diaHoy() + 'T05:00:00Z').getTime();
       const m1 = await pool.query(`SELECT 1 FROM momentos WHERE de=$1 AND ts>=$2 LIMIT 1`, [yo, inicioHoy]);
       const m2 = await pool.query(`SELECT 1 FROM mensajes WHERE de=$1 AND ts>=$2 LIMIT 1`, [yo, inicioHoy]);
@@ -296,14 +370,6 @@ io.on('connection', (socket) => {
         ],
       });
     } catch (e) { console.log('diario error', e.message); }
-  });
-
-  socket.on('ubi', async (data) => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo || !data) return;
-      await repartirUbi(yo, data.lat, data.lng);
-    } catch (e) { console.log('ubi error', e.message); }
   });
 
   socket.on('chat', async (msg) => {
@@ -358,35 +424,6 @@ io.on('connection', (socket) => {
       socket.emit('grupos', await gruposDe(yo));
       socket.emit('aviso', '👥 Grupo «' + d.nombre.trim() + '» creado 🎉');
     } catch (e) { console.log('grupo-crear error', e.message); }
-  });
-  socket.on('amistad-quitar', async (d) => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo || !d || !d.id) return;
-      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
-      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
-      sendTo(d.id, 'ubi-off', { id: yo });
-      sendTo(yo, 'ubi-off', { id: d.id });
-      await avisarEstado(yo);
-      await avisarEstado(d.id);
-      socket.emit('aviso', '💔 Dejaron de ser patas (y de compartir ubi)');
-    } catch (e) { console.log('quitar error', e.message); }
-  });
-
-  socket.on('bloquear', async (d) => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo || !d || !d.id) return;
-      await pool.query(`INSERT INTO bloqueos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [yo, d.id]);
-      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
-      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
-      await pool.query(`DELETE FROM solicitudes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.id]);
-      sendTo(d.id, 'ubi-off', { id: yo });
-      sendTo(yo, 'ubi-off', { id: d.id });
-      await avisarEstado(yo);
-      await avisarEstado(d.id);
-      socket.emit('aviso', '⛔ Usuario bloqueado: no podrá verte, escribirte ni enviarte solicitudes');
-    } catch (e) { console.log('bloquear error', e.message); }
   });
 
   socket.on('grupos', async () => {
@@ -449,6 +486,22 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('momento error', e.message); }
   });
 
+  socket.on('feed', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(
+        `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto,
+           (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
+           (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
+           EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
+         FROM momentos m JOIN usuarios u ON u.id=m.de
+         WHERE m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de)
+         ORDER BY m.ts DESC LIMIT 30`, [yo]);
+      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
+    } catch (e) { console.log('feed error', e.message); }
+  });
+
   socket.on('momentos-mapa', async () => {
     try {
       const yo = socketDe[socket.id];
@@ -459,10 +512,11 @@ io.on('connection', (socket) => {
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.lat IS NOT NULL AND m.ts >= $2
            AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
-         ORDER BY m.ts DESC LIMIT 50`, [yo, hace24h]);  
+         ORDER BY m.ts DESC LIMIT 50`, [yo, hace24h]);
       socket.emit('momentos-mapa', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
     } catch (e) { console.log('momentos-mapa error', e.message); }
   });
+
   socket.on('historias', async () => {
     try {
       const yo = socketDe[socket.id];
@@ -476,23 +530,6 @@ io.on('connection', (socket) => {
          ORDER BY m.ts ASC LIMIT 100`, [yo, hace24h]);
       socket.emit('historias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
     } catch (e) { console.log('historias error', e.message); }
-  });
-  
-
-  socket.on('feed', async () => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo) return;
-      const r = await pool.query(
-        `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto, m.lat, m.lng,
-           (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
-           (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
-           EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
-         FROM momentos m JOIN usuarios u ON u.id=m.de
-         WHERE m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de)
-         ORDER BY m.ts DESC LIMIT 30`, [yo]);
-      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
-    } catch (e) { console.log('feed error', e.message); }
   });
 
   socket.on('momento-like', async (d) => {
@@ -510,43 +547,6 @@ io.on('connection', (socket) => {
         if (!ya.rowCount) await crearNotif(own.rows[0].de, 'like', '♥ A ' + (await nombreDe(yo)) + ' le gustó tu momento');
       }
     } catch (e) { console.log('like error', e.message); }
-  });
-
-  socket.on('votos', async () => {
-    try {
-      const yo = socketDe[socket.id];
-      if (yo) socket.emit('votos', await contarVotos(yo));
-    } catch (e) {}
-  });
-
-  socket.on('votar', async (d) => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo || !d || !FEATS.includes(d.feat)) return;
-      await pool.query(`INSERT INTO feat_votos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [d.feat, yo]);
-      socket.emit('votos', await contarVotos(yo));
-    } catch (e) {}
-  });
-
-  socket.on('sugerir', async (d) => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo || !d || !d.texto || !d.texto.trim()) return;
-      await pool.query(`INSERT INTO sugerencias (de,texto,ts) VALUES ($1,$2,$3)`,
-        [yo, d.texto.trim().slice(0, 300), Date.now()]);
-      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
-      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
-      socket.emit('aviso', '💡 ¡Gracias! Tu idea alimenta a Boinci 🧡');
-    } catch (e) {}
-  });
-
-  socket.on('sugerencias', async () => {
-    try {
-      const yo = socketDe[socket.id];
-      if (!yo) return;
-      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
-      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
-    } catch (e) {}
   });
 
   socket.on('momento-borrar', async (d) => {
@@ -601,6 +601,43 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('comentar error', e.message); }
   });
 
+  socket.on('votos', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('votos', await contarVotos(yo));
+    } catch (e) {}
+  });
+
+  socket.on('votar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !FEATS.includes(d.feat)) return;
+      await pool.query(`INSERT INTO feat_votos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [d.feat, yo]);
+      socket.emit('votos', await contarVotos(yo));
+    } catch (e) {}
+  });
+
+  socket.on('sugerir', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.texto || !d.texto.trim()) return;
+      await pool.query(`INSERT INTO sugerencias (de,texto,ts) VALUES ($1,$2,$3)`,
+        [yo, d.texto.trim().slice(0, 300), Date.now()]);
+      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
+      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+      socket.emit('aviso', '💡 ¡Gracias! Tu idea alimenta a Boinci 🧡');
+    } catch (e) {}
+  });
+
+  socket.on('sugerencias', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
+      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+    } catch (e) {}
+  });
+
   socket.on('notifs', async () => {
     try {
       const yo = socketDe[socket.id];
@@ -621,19 +658,7 @@ io.on('connection', (socket) => {
   socket.on('perfil', async () => {
     try {
       const yo = socketDe[socket.id];
-      if (!yo) return;
-      const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
-      const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
-      const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
-      const li = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
-      socket.emit('perfil', {
-        n: u.rows[0] ? u.rows[0].n : 'Pata',
-        usuario: u.rows[0] ? u.rows[0].usuario : '',
-        bio: u.rows[0] ? (u.rows[0].bio || '') : '',
-        tipo: u.rows[0] ? (u.rows[0].tipo || 'personal') : 'personal',
-        patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
-      });
+      if (yo) socket.emit('perfil', await perfilDe(yo));
     } catch (e) { console.log('perfil error', e.message); }
   });
 
@@ -645,6 +670,7 @@ io.on('connection', (socket) => {
       socket.emit('aviso', 'Descripción actualizada ✏️');
     } catch (e) {}
   });
+
   socket.on('editar-perfil', async (d) => {
     try {
       const yo = socketDe[socket.id];
@@ -654,13 +680,7 @@ io.on('connection', (socket) => {
       if (!n) return;
       await pool.query(`UPDATE usuarios SET n=$2, usuario=$3 WHERE id=$1`, [yo, n, usuario]);
       socket.emit('aviso', '✏️ Perfil actualizado');
-      socket.emit('perfil', await (async () => {
-        const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
-        const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
-        const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
-        const li = await pool.query(`SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
-        return { n: u.rows[0].n, usuario: u.rows[0].usuario, bio: u.rows[0].bio || '', tipo: u.rows[0].tipo || 'personal', patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c };
-      })());
+      socket.emit('perfil', await perfilDe(yo));
       await avisarAmigos(yo);
     } catch (e) { console.log('editar error', e.message); }
   });
@@ -698,6 +718,53 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('perfil-de error', e.message); }
   });
 
+  // ===== WALLET (billetera digital) =====
+
+  socket.on('wallet', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('wallet', await walletDe(yo));
+    } catch (e) { console.log('wallet error', e.message); }
+  });
+
+  socket.on('wallet-recargar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d) return;
+      const monto = Math.min(500, Math.max(1, Number(d.monto) || 0));
+      if (!monto) return;
+      await pool.query(
+        `INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recarga',$2,$3,$4)`,
+        [yo, monto, 'Recarga (demo, sin dinero real)', Date.now()]);
+      socket.emit('wallet', await walletDe(yo));
+      socket.emit('aviso', '💳 Recarga de S/ ' + monto.toFixed(2) + ' acreditada (demo)');
+    } catch (e) { console.log('recargar error', e.message); }
+  });
+
+  socket.on('wallet-enviar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.para) return;
+      const monto = Math.round((Number(d.monto) || 0) * 100) / 100;
+      if (monto <= 0) return;
+      const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, d.para]);
+      if (!am.rowCount) { socket.emit('aviso', 'Solo puedes boinear plata a tus patas 🤝'); return; }
+      const saldo = await saldoDe(yo);
+      if (saldo < monto) { socket.emit('aviso', '😅 Saldo insuficiente: tienes S/ ' + saldo.toFixed(2)); return; }
+      const yoN = await nombreDe(yo);
+      const paraN = await nombreDe(d.para);
+      const ts = Date.now();
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'envio',$2,$3,$4)`,
+        [yo, monto, 'Enviaste a ' + paraN, ts]);
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recibido',$2,$3,$4)`,
+        [d.para, monto, 'Te envió ' + yoN + ' 🧡', ts]);
+      socket.emit('wallet', await walletDe(yo));
+      sendTo(d.para, 'wallet', await walletDe(d.para));
+      await crearNotif(d.para, 'wallet', '💸 ' + yoN + ' te boineó S/ ' + monto.toFixed(2));
+      socket.emit('aviso', '💸 Le boineaste S/ ' + monto.toFixed(2) + ' a ' + paraN);
+    } catch (e) { console.log('enviar error', e.message); }
+  });
+
   // ===== MERCADO / BUSINESS =====
 
   socket.on('biz-crear', async (d) => {
@@ -709,18 +776,8 @@ io.on('connection', (socket) => {
         `INSERT INTO negocios (id,nombre,descr,cat) VALUES ($1,$2,$3,$4)
          ON CONFLICT (id) DO UPDATE SET nombre=$2, descr=$3, cat=$4`,
         [yo, String(d.nombre).slice(0, 40), String(d.descr || '').slice(0, 120), d.cat || 'tienda']);
-      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
-      socket.emit('biz-mio', { negocio: n.rows[0], productos: [] });
-      const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
-      const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
-      const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
-      const li = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
-      socket.emit('perfil', {
-        n: u.rows[0].n, usuario: u.rows[0].usuario, bio: u.rows[0].bio || '',
-        tipo: u.rows[0].tipo || 'business',
-        patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
-      });
+      socket.emit('biz-mio', await bizMio(yo));
+      socket.emit('perfil', await perfilDe(yo));
       socket.emit('aviso', '🎉 ¡Tu negocio está en el Mercado de Boin!');
     } catch (e) { console.log('biz-crear error', e.message); }
   });
@@ -728,11 +785,7 @@ io.on('connection', (socket) => {
   socket.on('biz-mio', async () => {
     try {
       const yo = socketDe[socket.id];
-      if (!yo) return;
-      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
-      if (!n.rowCount) { socket.emit('biz-mio', { negocio: null, productos: [] }); return; }
-      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
-      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+      if (yo) socket.emit('biz-mio', await bizMio(yo));
     } catch (e) { console.log('biz-mio error', e.message); }
   });
 
@@ -744,10 +797,22 @@ io.on('connection', (socket) => {
       if (!biz.rowCount) return;
       await pool.query(`INSERT INTO productos (negocio,nombre,precio) VALUES ($1,$2,$3)`,
         [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0)]);
-      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
-      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
-      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+      socket.emit('biz-mio', await bizMio(yo));
     } catch (e) { console.log('producto error', e.message); }
+  });
+
+  socket.on('producto-editar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const nombre = String(d.nombre || '').slice(0, 40);
+      const precio = Math.max(0, Number(d.precio) || 0);
+      if (!nombre || !precio) return;
+      await pool.query(`UPDATE productos SET nombre=$2, precio=$3 WHERE id=$1 AND negocio=$4`,
+        [d.id, nombre, precio, yo]);
+      socket.emit('biz-mio', await bizMio(yo));
+      socket.emit('aviso', '✏️ Producto actualizado');
+    } catch (e) { console.log('editar producto error', e.message); }
   });
 
   socket.on('producto-borrar', async (d) => {
@@ -755,9 +820,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.id) return;
       await pool.query(`DELETE FROM productos WHERE id=$1 AND negocio=$2`, [d.id, yo]);
-      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
-      const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
-      socket.emit('biz-mio', { negocio: n.rows[0], productos: p.rows });
+      socket.emit('biz-mio', await bizMio(yo));
     } catch (e) {}
   });
 
@@ -827,7 +890,10 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.lat || !d.lng) return;
       const r = await pool.query(`UPDATE negocios SET lat=$2, lng=$3 WHERE id=$1`, [yo, d.lat, d.lng]);
-      if (r.rowCount) socket.emit('aviso', '📍 ¡Tu local quedó fijado en el mapa de Boin!');
+      if (r.rowCount) {
+        socket.emit('aviso', '📍 ¡Tu local quedó fijado en el mapa de Boin!');
+        socket.emit('biz-mio', await bizMio(yo));
+      }
     } catch (e) { console.log('biz-ubi error', e.message); }
   });
 
@@ -857,5 +923,5 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-initDb().then(() => server.listen(PORT, () => console.log('Boin server v9 en puerto', PORT)))
+initDb().then(() => server.listen(PORT, () => console.log('Boin server v10 en puerto', PORT)))
   .catch(e => { console.log('Error de base de datos:', e.message); server.listen(PORT); });
