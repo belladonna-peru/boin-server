@@ -592,6 +592,25 @@ io.on('connection', (socket) => {
       socket.emit('aviso', 'Descripción actualizada ✏️');
     } catch (e) {}
   });
+  socket.on('editar-perfil', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d) return;
+      const n = String(d.n || '').trim().slice(0, 30);
+      const usuario = String(d.usuario || '').trim().slice(0, 20);
+      if (!n) return;
+      await pool.query(`UPDATE usuarios SET n=$2, usuario=$3 WHERE id=$1`, [yo, n, usuario]);
+      socket.emit('aviso', '✏️ Perfil actualizado');
+      socket.emit('perfil', await (async () => {
+        const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
+        const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
+        const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
+        const li = await pool.query(`SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [yo]);
+        return { n: u.rows[0].n, usuario: u.rows[0].usuario, bio: u.rows[0].bio || '', tipo: u.rows[0].tipo || 'personal', patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c };
+      })());
+      await avisarAmigos(yo);
+    } catch (e) { console.log('editar error', e.message); }
+  });
 
   socket.on('perfil-de', async (d) => {
     try {
