@@ -22,6 +22,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS notifs ( id SERIAL PRIMARY KEY, para TEXT, tipo TEXT, texto TEXT, ts BIGINT, leida BOOLEAN DEFAULT FALSE );
     CREATE TABLE IF NOT EXISTS negocios ( id TEXT PRIMARY KEY, nombre TEXT, descr TEXT, cat TEXT );
     CREATE TABLE IF NOT EXISTS productos ( id SERIAL PRIMARY KEY, negocio TEXT, nombre TEXT, precio NUMERIC );
+    CREATE TABLE IF NOT EXISTS comentarios ( id SERIAL PRIMARY KEY, momento_id INT, de TEXT, texto TEXT, padre INT, ts BIGINT );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -267,11 +268,12 @@ io.on('connection', (socket) => {
       const r = await pool.query(
         `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto,
            (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
+           (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
            EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de)
          ORDER BY m.ts DESC LIMIT 30`, [yo]);
-      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, meGusta: x.megusta })));
+      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
     } catch (e) { console.log('feed error', e.message); }
   });
 
@@ -290,6 +292,43 @@ io.on('connection', (socket) => {
         if (!ya.rowCount) await crearNotif(own.rows[0].de, 'like', '♥ A ' + (await nombreDe(yo)) + ' le gustó tu momento');
       }
     } catch (e) { console.log('like error', e.message); }
+  });
+
+  socket.on('comentarios', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const r = await pool.query(
+        `SELECT c.id, c.de, u.n, c.texto, c.padre, c.ts
+         FROM comentarios c JOIN usuarios u ON u.id=c.de
+         WHERE c.momento_id=$1 ORDER BY c.ts ASC LIMIT 100`, [d.id]);
+      socket.emit('comentarios', { id: d.id, lista: r.rows.map(x => ({ ...x, ts: Number(x.ts) })) });
+    } catch (e) { console.log('comentarios error', e.message); }
+  });
+
+  socket.on('comentar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id || !d.texto || !d.texto.trim()) return;
+      const ts = Date.now();
+      await pool.query(
+        `INSERT INTO comentarios (momento_id,de,texto,padre,ts) VALUES ($1,$2,$3,$4,$5)`,
+        [d.id, yo, d.texto.trim().slice(0, 200), d.padre || null, ts]);
+      const r = await pool.query(
+        `SELECT c.id, c.de, u.n, c.texto, c.padre, c.ts
+         FROM comentarios c JOIN usuarios u ON u.id=c.de
+         WHERE c.momento_id=$1 ORDER BY c.ts ASC LIMIT 100`, [d.id]);
+      const lista = r.rows.map(x => ({ ...x, ts: Number(x.ts) }));
+      const c = await pool.query(`SELECT COUNT(*)::int AS n FROM comentarios WHERE momento_id=$1`, [d.id]);
+      socket.emit('comentarios', { id: d.id, lista });
+      socket.emit('momento-coms', { id: d.id, coms: c.rows[0].n });
+      const own = await pool.query(`SELECT de FROM momentos WHERE id=$1`, [d.id]);
+      if (own.rowCount && own.rows[0].de !== yo) {
+        sendTo(own.rows[0].de, 'comentarios', { id: d.id, lista });
+        sendTo(own.rows[0].de, 'momento-coms', { id: d.id, coms: c.rows[0].n });
+        await crearNotif(own.rows[0].de, 'coment', '💬 ' + (await nombreDe(yo)) + ' comentó tu momento');
+      }
+    } catch (e) { console.log('comentar error', e.message); }
   });
 
   socket.on('notifs', async () => {
