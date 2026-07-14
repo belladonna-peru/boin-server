@@ -23,6 +23,8 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS negocios ( id TEXT PRIMARY KEY, nombre TEXT, descr TEXT, cat TEXT );
     CREATE TABLE IF NOT EXISTS productos ( id SERIAL PRIMARY KEY, negocio TEXT, nombre TEXT, precio NUMERIC );
     CREATE TABLE IF NOT EXISTS comentarios ( id SERIAL PRIMARY KEY, momento_id INT, de TEXT, texto TEXT, padre INT, ts BIGINT );
+    ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
+    ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -510,6 +512,25 @@ io.on('connection', (socket) => {
       await avisarEstado(d.negocio);
       socket.emit('aviso', '✅ Pedido enviado: coordina el pago (Yape) y la entrega en el Chat');
     } catch (e) { console.log('pedido error', e.message); }
+  });
+
+  socket.on('biz-ubi', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.lat || !d.lng) return;
+      const r = await pool.query(`UPDATE negocios SET lat=$2, lng=$3 WHERE id=$1`, [yo, d.lat, d.lng]);
+      if (r.rowCount) socket.emit('aviso', '📍 ¡Tu local quedó fijado en el mapa de Boin!');
+    } catch (e) { console.log('biz-ubi error', e.message); }
+  });
+
+  socket.on('negocios-mapa', async () => {
+    try {
+      const r = await pool.query(
+        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng,
+           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
+         FROM negocios n WHERE n.lat IS NOT NULL`);
+      socket.emit('negocios-mapa', r.rows.map(x => ({ ...x, online: !!(online[x.id] && online[x.id].size) })));
+    } catch (e) { console.log('negocios-mapa error', e.message); }
   });
 
   socket.on('escribiendo', (d) => {
