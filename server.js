@@ -54,6 +54,7 @@ const io = new Server(undefined, { cors: { origin: '*' } });
 const online = {};
 const socketDe = {};
 const ubiCache = {};
+const puntosCache = {}; // punto de encuentro activo por usuario (memoria, expira en 2 h)
 
 function sendTo(userId, event, payload) {
   const set = online[userId];
@@ -244,6 +245,51 @@ io.on('connection', (socket) => {
     next();
   });
   socket.on('disconnect', () => clearInterval(limitador));
+  socket.on('boinear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.para) return;
+      const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, d.para]);
+      if (!am.rowCount) return;
+      const yoN = await nombreDe(yo);
+      const ts = Date.now();
+      const texto = '⚡ ¡BOIN! Ya voy en camino 📍';
+      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, d.para, texto, ts]);
+      sendTo(d.para, 'chat', { de: yo, para: d.para, texto, ts });
+      sendTo(yo, 'chat', { de: yo, para: d.para, texto, ts });
+      await crearNotif(d.para, 'boin', '⚡🧡 ¡' + yoN + ' va en camino hacia ti!');
+      await avisarEstado(d.para);
+      socket.emit('aviso', '⚡ ¡Boin enviado! ' + (await nombreDe(d.para)) + ' sabe que vas en camino');
+    } catch (e) { console.log('boinear error', e.message); }
+  });
+
+  socket.on('punto', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.lat || !d.lng) return;
+      const yoN = await nombreDe(yo);
+      puntosCache[yo] = { id: yo, n: yoN, lat: d.lat, lng: d.lng, ts: Date.now() };
+      const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
+      for (const row of ams.rows) {
+        sendTo(row.b, 'punto', puntosCache[yo]);
+        await crearNotif(row.b, 'punto', '🚩 ' + yoN + ' marcó un punto de encuentro: ¡caigan ahí!');
+      }
+      socket.emit('punto', puntosCache[yo]);
+      socket.emit('aviso', '🚩 Punto marcado: tus patas ya lo ven en su mapa (dura 2 h)');
+    } catch (e) { console.log('punto error', e.message); }
+  });
+
+  socket.on('punto-off', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !puntosCache[yo]) return;
+      delete puntosCache[yo];
+      const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
+      ams.rows.forEach(row => sendTo(row.b, 'punto-off', { id: yo }));
+      socket.emit('punto-off', { id: yo });
+      socket.emit('aviso', '🚩 Punto de encuentro retirado');
+    } catch (e) {}
+  });
 
   socket.on('hola', async (d) => {
     try {
