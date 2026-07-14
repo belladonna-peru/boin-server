@@ -37,6 +37,15 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS dias_activos ( uid TEXT, dia TEXT, PRIMARY KEY (uid, dia) );
     CREATE TABLE IF NOT EXISTS wallet_mov ( id SERIAL PRIMARY KEY, uid TEXT, tipo TEXT, monto NUMERIC, detalle TEXT, ts BIGINT );
     CREATE TABLE IF NOT EXISTS pedidos ( id SERIAL PRIMARY KEY, de TEXT, negocio TEXT, detalle TEXT, total NUMERIC, estado TEXT DEFAULT 'recibido', pagado BOOLEAN DEFAULT FALSE, ts BIGINT );
+    CREATE INDEX IF NOT EXISTS idx_mensajes_para ON mensajes(para, leido);
+    CREATE INDEX IF NOT EXISTS idx_mensajes_par ON mensajes(de, para, ts);
+    CREATE INDEX IF NOT EXISTS idx_momentos_de ON momentos(de, ts);
+    CREATE INDEX IF NOT EXISTS idx_notifs_para ON notifs(para, ts);
+    CREATE INDEX IF NOT EXISTS idx_amistades_a ON amistades(a);
+    CREATE INDEX IF NOT EXISTS idx_comentarios_mid ON comentarios(momento_id);
+    CREATE INDEX IF NOT EXISTS idx_pedidos_de ON pedidos(de);
+    CREATE INDEX IF NOT EXISTS idx_pedidos_neg ON pedidos(negocio);
+    CREATE INDEX IF NOT EXISTS idx_wallet_uid ON wallet_mov(uid, ts);
   `);
   console.log('Base de datos lista ✅');
 }
@@ -225,6 +234,14 @@ const server = http.createServer((req, res) => {
 io.attach(server);
 
 io.on('connection', (socket) => {
+  let eventosSeg = 0;
+  const limitador = setInterval(() => { eventosSeg = 0; }, 1000);
+  socket.use((_, next) => {
+    eventosSeg++;
+    if (eventosSeg > 30) return; // silenciosamente ignora el exceso
+    next();
+  });
+  socket.on('disconnect', () => clearInterval(limitador));
 
   socket.on('hola', async (d) => {
     try {
@@ -1014,5 +1031,14 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// Limpieza diaria: notificaciones de +30 días y registros de actividad de +90 días
+setInterval(async () => {
+  try {
+    await pool.query(`DELETE FROM notifs WHERE ts < $1`, [Date.now() - 30 * 24 * 3600 * 1000]);
+    await pool.query(`DELETE FROM dias_activos WHERE dia < $1`,
+      [new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString().slice(0, 10)]);
+    console.log('🧹 Limpieza diaria completada');
+  } catch (e) { console.log('limpieza error', e.message); }
+}, 24 * 3600 * 1000);
 initDb().then(() => server.listen(PORT, () => console.log('Boin server v10 en puerto', PORT)))
   .catch(e => { console.log('Error de base de datos:', e.message); server.listen(PORT); });
