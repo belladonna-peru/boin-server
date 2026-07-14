@@ -376,6 +376,39 @@ io.on('connection', (socket) => {
     } catch (e) {}
   });
 
+  socket.on('perfil-de', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const u = await pool.query(
+        `SELECT u.n, u.usuario, u.bio, u.tipo, ng.nombre AS bizn, ng.descr AS bizd, ng.cat AS bizc
+         FROM usuarios u LEFT JOIN negocios ng ON ng.id=u.id WHERE u.id=$1`, [d.id]);
+      if (!u.rowCount) return;
+      const x = u.rows[0];
+      const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [d.id]);
+      const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [d.id]);
+      const li = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE m.de=$1`, [d.id]);
+      const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, d.id]);
+      const pe = await pool.query(`SELECT 1 FROM solicitudes WHERE de=$1 AND para=$2`, [yo, d.id]);
+      const esAmigo = !!am.rowCount;
+      let moms = [];
+      if (esAmigo || d.id === yo) {
+        const r = await pool.query(
+          `SELECT id, texto, color, foto, ts FROM momentos WHERE de=$1 ORDER BY ts DESC LIMIT 12`, [d.id]);
+        moms = r.rows.map(m => ({ ...m, ts: Number(m.ts) }));
+      }
+      socket.emit('perfil-de', {
+        id: d.id, n: x.n, usuario: x.usuario, bio: x.bio || '', tipo: x.tipo || 'personal',
+        biz: x.bizn ? { nombre: x.bizn, descr: x.bizd, cat: x.bizc } : null,
+        patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
+        esAmigo, pendiente: !!pe.rowCount,
+        online: !!(online[d.id] && online[d.id].size),
+        moms,
+      });
+    } catch (e) { console.log('perfil-de error', e.message); }
+  });
+
   // ===== MERCADO / BUSINESS =====
 
   socket.on('biz-crear', async (d) => {
