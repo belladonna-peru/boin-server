@@ -41,6 +41,7 @@ async function initDb() {
 
 const io = new Server(undefined, { cors: { origin: '*' } });
 const online = {};
+const ubiCache = {}; // última ubi conocida de cada usuario conectado (solo en memoria)
 const socketDe = {};
 
 function sendTo(userId, event, payload) {
@@ -73,6 +74,7 @@ async function crearNotif(para, tipo, texto) {
 }
 
 async function repartirUbi(yo, lat, lng) {
+  ubiCache[yo] = { lat, lng, ts: Date.now() };
   const n = await nombreDe(yo);
   const r = await pool.query(
     `SELECT c.con FROM comparto c
@@ -169,6 +171,22 @@ const server = http.createServer((req, res) => {
 io.attach(server);
 
 io.on('connection', (socket) => {
+  socket.on('zonas', () => {
+    try {
+      const ahora = Date.now();
+      const celdas = {};
+      Object.values(ubiCache).forEach(u => {
+        if (ahora - u.ts > 120000) return; // solo ubis de los últimos 2 min
+        const k = Math.round(u.lat / 0.003) + '_' + Math.round(u.lng / 0.003); // celdas de ~330 m
+        celdas[k] = celdas[k] || { lat: 0, lng: 0, n: 0 };
+        celdas[k].lat += u.lat; celdas[k].lng += u.lng; celdas[k].n++;
+      });
+      const zonas = Object.values(celdas)
+        .filter(c => c.n >= 2) // mínimo 2 personas para marcar zona (anonimato)
+        .map(c => ({ lat: c.lat / c.n, lng: c.lng / c.n, n: c.n }));
+      socket.emit('zonas', zonas);
+    } catch (e) {}
+  });
 
   socket.on('hola', async (d) => {
     try {
@@ -441,7 +459,7 @@ io.on('connection', (socket) => {
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.lat IS NOT NULL AND m.ts >= $2
            AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
-         ORDER BY m.ts DESC LIMIT 50`, [yo, hace24h]);
+         ORDER BY m.ts DESC LIMIT 50`, [yo, hace24h]);  
       socket.emit('momentos-mapa', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
     } catch (e) { console.log('momentos-mapa error', e.message); }
   });
