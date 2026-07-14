@@ -95,6 +95,7 @@ async function estadoDe(id) {
   const am = await pool.query(
     `SELECT u.id, u.n, u.usuario,
             EXISTS(SELECT 1 FROM comparto c WHERE c.de=$1 AND c.con=u.id) AS lecomparto,
+            EXISTS(SELECT 1 FROM comparto c2 WHERE c2.de=u.id AND c2.con=$1) AS mecomparte,
             (SELECT COUNT(*) FROM mensajes ms WHERE ms.de=u.id AND ms.para=$1 AND ms.leido=FALSE)::int AS noleidos
      FROM amistades a JOIN usuarios u ON u.id=a.b WHERE a.a=$1`, [id]);
   const so = await pool.query(
@@ -123,7 +124,7 @@ async function estadoDe(id) {
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, noLeidos: r.noleidos, })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, noLeidos: r.noleidos, meComparte: r.mecomparte, })),
       ...extras,
     ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario })),
