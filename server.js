@@ -36,6 +36,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS bloqueos ( de TEXT, a TEXT, PRIMARY KEY (de, a) );
     CREATE TABLE IF NOT EXISTS dias_activos ( uid TEXT, dia TEXT, PRIMARY KEY (uid, dia) );
     CREATE TABLE IF NOT EXISTS wallet_mov ( id SERIAL PRIMARY KEY, uid TEXT, tipo TEXT, monto NUMERIC, detalle TEXT, ts BIGINT );
+    CREATE TABLE IF NOT EXISTS pedidos ( id SERIAL PRIMARY KEY, de TEXT, negocio TEXT, detalle TEXT, total NUMERIC, estado TEXT DEFAULT 'recibido', pagado BOOLEAN DEFAULT FALSE, ts BIGINT );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -175,6 +176,22 @@ async function bizMio(yo) {
   if (!n.rowCount) return { negocio: null, productos: [] };
   const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
   return { negocio: n.rows[0], productos: p.rows };
+}
+
+async function pedidosDe(yo) {
+  const r = await pool.query(
+    `SELECT p.id, p.detalle, p.total::float, p.estado, p.pagado, p.ts, COALESCE(ng.nombre, u.n) AS nombre
+     FROM pedidos p JOIN usuarios u ON u.id=p.negocio LEFT JOIN negocios ng ON ng.id=p.negocio
+     WHERE p.de=$1 ORDER BY p.ts DESC LIMIT 20`, [yo]);
+  return r.rows.map(x => ({ ...x, ts: Number(x.ts) }));
+}
+
+async function pedidosNegocio(yo) {
+  const r = await pool.query(
+    `SELECT p.id, p.de, p.detalle, p.total::float, p.estado, p.pagado, p.ts, u.n AS nombre
+     FROM pedidos p JOIN usuarios u ON u.id=p.de
+     WHERE p.negocio=$1 ORDER BY p.ts DESC LIMIT 30`, [yo]);
+  return r.rows.map(x => ({ ...x, ts: Number(x.ts) }));
 }
 
 const FEATS = ['llamadas', 'wallet', 'streamer', 'mascotas'];
@@ -850,17 +867,91 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.negocio || !d.items || !d.items.length) return;
       const total = d.items.reduce((a, it) => a + (Number(it.precio) || 0) * (it.cant || 1), 0);
       const lineas = d.items.map(it => it.cant + 'x ' + it.nombre).join(', ');
-      const texto = '🛍️ PEDIDO: ' + lineas + ' — Total S/ ' + total.toFixed(2);
       const ts = Date.now();
+      const p = await pool.query(
+        `INSERT INTO pedidos (de,negocio,detalle,total,ts) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [yo, d.negocio, lineas.slice(0, 300), total, ts]);
+      const pid = p.rows[0].id;
+      const texto = '🛍️ PEDIDO #' + pid + ': ' + lineas + ' — Total S/ ' + total.toFixed(2);
       await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, d.negocio, texto, ts]);
       const m = { de: yo, para: d.negocio, texto, ts };
       sendTo(d.negocio, 'chat', m);
       sendTo(yo, 'chat', m);
-      await crearNotif(d.negocio, 'pedido', '🛍️ Nuevo pedido de ' + (await nombreDe(yo)) + ' — S/ ' + total.toFixed(2));
+      await crearNotif(d.negocio, 'pedido', '🛍️ Nuevo pedido #' + pid + ' de ' + (await nombreDe(yo)) + ' — S/ ' + total.toFixed(2));
+      sendTo(yo, 'pedidos-mios', await pedidosDe(yo));
+      sendTo(d.negocio, 'pedidos-negocio', await pedidosNegocio(d.negocio));
       await avisarEstado(yo);
       await avisarEstado(d.negocio);
-      socket.emit('aviso', '✅ Pedido enviado: coordina el pago (Yape) y la entrega en el Chat');
+      socket.emit('aviso', '✅ Pedido #' + pid + ' enviado: síguelo en Mercado → 📦 Mis pedidos');
     } catch (e) { console.log('pedido error', e.message); }
+  });
+
+  socket.on('pedidos-mios', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('pedidos-mios', await pedidosDe(yo));
+    } catch (e) {}
+  });
+
+  socket.on('pedidos-negocio', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('pedidos-negocio', await pedidosNegocio(yo));
+    } catch (e) {}
+  });
+
+  socket.on('pedido-estado', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      const ESTADOS = ['recibido', 'preparando', 'listo', 'entregado'];
+      if (!yo || !d || !d.id || !ESTADOS.includes(d.estado)) return;
+      const p = await pool.query(`SELECT de, negocio FROM pedidos WHERE id=$1`, [d.id]);
+      if (!p.rowCount || p.rows[0].negocio !== yo) return;
+      await pool.query(`UPDATE pedidos SET estado=$2 WHERE id=$1`, [d.id, d.estado]);
+      const cliente = p.rows[0].de;
+      const EMOJI = { recibido: '🕐', preparando: '👨‍🍳', listo: '✅', entregado: '📦' };
+      const ts = Date.now();
+      const texto = EMOJI[d.estado] + ' Pedido #' + d.id + ': ' + d.estado.toUpperCase();
+      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, cliente, texto, ts]);
+      sendTo(cliente, 'chat', { de: yo, para: cliente, texto, ts });
+      sendTo(yo, 'chat', { de: yo, para: cliente, texto, ts });
+      await crearNotif(cliente, 'pedido', EMOJI[d.estado] + ' Tu pedido #' + d.id + ' está ' + d.estado.toUpperCase());
+      sendTo(cliente, 'pedidos-mios', await pedidosDe(cliente));
+      socket.emit('pedidos-negocio', await pedidosNegocio(yo));
+      await avisarEstado(cliente);
+    } catch (e) { console.log('pedido-estado error', e.message); }
+  });
+
+  socket.on('pedido-pagar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const p = await pool.query(`SELECT de, negocio, total::float, pagado FROM pedidos WHERE id=$1`, [d.id]);
+      if (!p.rowCount || p.rows[0].de !== yo) return;
+      if (p.rows[0].pagado) { socket.emit('aviso', 'Ese pedido ya está pagado ✅'); return; }
+      const total = p.rows[0].total;
+      const negocio = p.rows[0].negocio;
+      const saldo = await saldoDe(yo);
+      if (saldo < total) { socket.emit('aviso', '😅 Saldo insuficiente: tienes S/ ' + saldo.toFixed(2) + ' y el pedido es S/ ' + total.toFixed(2)); return; }
+      const yoN = await nombreDe(yo);
+      const negN = await nombreDe(negocio);
+      const ts = Date.now();
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'envio',$2,$3,$4)`,
+        [yo, total, 'Pago pedido #' + d.id + ' a ' + negN, ts]);
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recibido',$2,$3,$4)`,
+        [negocio, total, 'Cobro pedido #' + d.id + ' de ' + yoN + ' 💳', ts]);
+      await pool.query(`UPDATE pedidos SET pagado=TRUE WHERE id=$1`, [d.id]);
+      const texto = '💳 Pagué el pedido #' + d.id + ' con mi Wallet Boin — S/ ' + total.toFixed(2);
+      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, negocio, texto, ts]);
+      sendTo(negocio, 'chat', { de: yo, para: negocio, texto, ts });
+      sendTo(yo, 'chat', { de: yo, para: negocio, texto, ts });
+      await crearNotif(negocio, 'wallet', '💳 ' + yoN + ' pagó el pedido #' + d.id + ' — S/ ' + total.toFixed(2) + ' a tu Wallet');
+      socket.emit('wallet', await walletDe(yo));
+      sendTo(negocio, 'wallet', await walletDe(negocio));
+      socket.emit('pedidos-mios', await pedidosDe(yo));
+      sendTo(negocio, 'pedidos-negocio', await pedidosNegocio(negocio));
+      socket.emit('aviso', '💳 ¡Pagado! S/ ' + total.toFixed(2) + ' fueron a la Wallet de ' + negN);
+    } catch (e) { console.log('pedido-pagar error', e.message); }
   });
 
   socket.on('mis-pedidos', async () => {
