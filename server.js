@@ -30,6 +30,8 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS mensajes_grupo ( id SERIAL PRIMARY KEY, grupo INT, de TEXT, texto TEXT, ts BIGINT );
     CREATE TABLE IF NOT EXISTS sugerencias ( id SERIAL PRIMARY KEY, de TEXT, texto TEXT, ts BIGINT );
     CREATE TABLE IF NOT EXISTS feat_votos ( feat TEXT, de TEXT, PRIMARY KEY (feat, de) );
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS leido BOOLEAN DEFAULT FALSE;
+    CREATE TABLE IF NOT EXISTS bloqueos ( de TEXT, a TEXT, PRIMARY KEY (de, a) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -72,16 +74,23 @@ async function repartirUbi(yo, lat, lng) {
 }
 
 async function puedenChatear(a, b) {
+  if (await hayBloqueo(a, b)) return false;
   const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [a, b]);
   if (am.rowCount) return true;
   const biz = await pool.query(`SELECT 1 FROM usuarios WHERE (id=$1 OR id=$2) AND tipo='business'`, [a, b]);
   return !!biz.rowCount;
 }
+async function hayBloqueo(a, b) {
+  const r = await pool.query(
+    `SELECT 1 FROM bloqueos WHERE (de=$1 AND a=$2) OR (de=$2 AND a=$1)`, [a, b]);
+  return !!r.rowCount;
+}
 
 async function estadoDe(id) {
   const am = await pool.query(
     `SELECT u.id, u.n, u.usuario,
-            EXISTS(SELECT 1 FROM comparto c WHERE c.de=$1 AND c.con=u.id) AS lecomparto
+            EXISTS(SELECT 1 FROM comparto c WHERE c.de=$1 AND c.con=u.id) AS lecomparto,
+            (SELECT COUNT(*) FROM mensajes ms WHERE ms.de=u.id AND ms.para=$1 AND ms.leido=FALSE)::int AS noleidos
      FROM amistades a JOIN usuarios u ON u.id=a.b WHERE a.a=$1`, [id]);
   const so = await pool.query(
     `SELECT s.de, u.n AS den, u.usuario FROM solicitudes s JOIN usuarios u ON u.id=s.de WHERE s.para=$1`, [id]);
@@ -103,12 +112,13 @@ async function estadoDe(id) {
         online: !!(online[row.cid] && online[row.cid].size),
         leComparto: false,
         biz: u.rows[0].tipo === 'business',
+        noLeidos: 0,
       });
     }
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, noLeidos: r.noleidos, })),
       ...extras,
     ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario })),
@@ -196,6 +206,7 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.para || d.para === yo) return;
       const ya = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, d.para]);
       if (ya.rowCount) return;
+      if (await hayBloqueo(yo, d.para)) return;
       await pool.query(`INSERT INTO solicitudes (de,para) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [yo, d.para]);
       await avisarEstado(d.para);
       await crearNotif(d.para, 'solicitud', '🧡 ' + (await nombreDe(yo)) + ' te envió una solicitud');
@@ -251,6 +262,7 @@ io.on('connection', (socket) => {
       const m = { de: yo, para: msg.para, texto: msg.texto, ts };
       sendTo(msg.para, 'chat', m);
       sendTo(yo, 'chat', m);
+      await avisarEstado(msg.para);
     } catch (e) { console.log('chat error', e.message); }
   });
 
@@ -263,6 +275,8 @@ io.on('connection', (socket) => {
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', { con: d.con, lista: r.rows.reverse().map(x => ({ ...x, ts: Number(x.ts) })) });
+      await pool.query(`UPDATE mensajes SET leido=TRUE WHERE de=$2 AND para=$1 AND leido=FALSE`, [yo, d.con]);
+      await avisarEstado(yo);
     } catch (e) { console.log('historial error', e.message); }
   });
 
@@ -287,6 +301,35 @@ io.on('connection', (socket) => {
       socket.emit('grupos', await gruposDe(yo));
       socket.emit('aviso', '👥 Grupo «' + d.nombre.trim() + '» creado 🎉');
     } catch (e) { console.log('grupo-crear error', e.message); }
+  });
+  socket.on('amistad-quitar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
+      sendTo(d.id, 'ubi-off', { id: yo });
+      sendTo(yo, 'ubi-off', { id: d.id });
+      await avisarEstado(yo);
+      await avisarEstado(d.id);
+      socket.emit('aviso', '💔 Dejaron de ser patas (y de compartir ubi)');
+    } catch (e) { console.log('quitar error', e.message); }
+  });
+
+  socket.on('bloquear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`INSERT INTO bloqueos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [yo, d.id]);
+      await pool.query(`DELETE FROM amistades WHERE (a=$1 AND b=$2) OR (a=$2 AND b=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM comparto WHERE (de=$1 AND con=$2) OR (de=$2 AND con=$1)`, [yo, d.id]);
+      await pool.query(`DELETE FROM solicitudes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.id]);
+      sendTo(d.id, 'ubi-off', { id: yo });
+      sendTo(yo, 'ubi-off', { id: d.id });
+      await avisarEstado(yo);
+      await avisarEstado(d.id);
+      socket.emit('aviso', '⛔ Usuario bloqueado: no podrá verte, escribirte ni enviarte solicitudes');
+    } catch (e) { console.log('bloquear error', e.message); }
   });
 
   socket.on('grupos', async () => {
