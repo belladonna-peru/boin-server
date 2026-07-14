@@ -46,6 +46,8 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_pedidos_de ON pedidos(de);
     CREATE INDEX IF NOT EXISTS idx_pedidos_neg ON pedidos(negocio);
     CREATE INDEX IF NOT EXISTS idx_wallet_uid ON wallet_mov(uid, ts);
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS foto TEXT;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS cita TEXT;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -457,14 +459,20 @@ io.on('connection', (socket) => {
   socket.on('chat', async (msg) => {
     try {
       const yo = socketDe[socket.id];
-      if (!yo || !msg || !msg.para || !msg.texto) return;
+      if (!yo || !msg || !msg.para) return;
+      const texto = (msg.texto || '').slice(0, 500);
+      const foto = (msg.foto && String(msg.foto).startsWith('https://')) ? String(msg.foto).slice(0, 500) : null;
+      const cita = msg.cita ? String(msg.cita).slice(0, 140) : null;
+      if (!texto && !foto) return;
       if (!(await puedenChatear(yo, msg.para))) {
         socket.emit('aviso', 'Primero deben ser patas: envíale una solicitud 🤝');
         return;
       }
       const ts = Date.now();
-      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, msg.para, msg.texto, ts]);
-      const m = { de: yo, para: msg.para, texto: msg.texto, ts };
+      const r = await pool.query(
+        `INSERT INTO mensajes (de,para,texto,ts,foto,cita) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [yo, msg.para, texto, ts, foto, cita]);
+      const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, cita, leido: false };
       sendTo(msg.para, 'chat', m);
       sendTo(yo, 'chat', m);
       await avisarEstado(msg.para);
@@ -476,13 +484,25 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT de, para, texto, ts FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, cita, leido FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', { con: d.con, lista: r.rows.reverse().map(x => ({ ...x, ts: Number(x.ts) })) });
       await pool.query(`UPDATE mensajes SET leido=TRUE WHERE de=$2 AND para=$1 AND leido=FALSE`, [yo, d.con]);
+      sendTo(d.con, 'leidos', { por: yo });
       await avisarEstado(yo);
     } catch (e) { console.log('historial error', e.message); }
+  });
+  socket.on('msg-borrar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const m = await pool.query(`SELECT de, para FROM mensajes WHERE id=$1`, [d.id]);
+      if (!m.rowCount || m.rows[0].de !== yo) return;
+      await pool.query(`UPDATE mensajes SET texto='🚫 Mensaje eliminado', foto=NULL, cita=NULL WHERE id=$1`, [d.id]);
+      sendTo(yo, 'msg-borrado', { id: d.id });
+      sendTo(m.rows[0].para, 'msg-borrado', { id: d.id });
+    } catch (e) {}
   });
 
   socket.on('grupo-crear', async (d) => {
