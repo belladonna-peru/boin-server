@@ -764,7 +764,7 @@ io.on('connection', (socket) => {
   socket.on('negocios', async () => {
     try {
       const r = await pool.query(
-        `SELECT n.id, n.nombre, n.descr, n.cat,
+        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng,
            (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
          FROM negocios n ORDER BY n.nombre`);
       socket.emit('negocios', r.rows.map(x => ({ ...x, online: !!(online[x.id] && online[x.id].size) })));
@@ -798,6 +798,28 @@ io.on('connection', (socket) => {
       await avisarEstado(d.negocio);
       socket.emit('aviso', '✅ Pedido enviado: coordina el pago (Yape) y la entrega en el Chat');
     } catch (e) { console.log('pedido error', e.message); }
+  });
+
+  socket.on('mis-pedidos', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const env = await pool.query(
+        `SELECT m.texto, m.ts, COALESCE(ng.nombre, u.n) AS nombre
+         FROM mensajes m JOIN usuarios u ON u.id=m.para
+         LEFT JOIN negocios ng ON ng.id=m.para
+         WHERE m.de=$1 AND m.texto LIKE '🛍️ PEDIDO%'
+         ORDER BY m.ts DESC LIMIT 20`, [yo]);
+      const rec = await pool.query(
+        `SELECT m.texto, m.ts, u.n AS nombre
+         FROM mensajes m JOIN usuarios u ON u.id=m.de
+         WHERE m.para=$1 AND m.texto LIKE '🛍️ PEDIDO%'
+         ORDER BY m.ts DESC LIMIT 20`, [yo]);
+      socket.emit('mis-pedidos', {
+        enviados: env.rows.map(x => ({ ...x, ts: Number(x.ts) })),
+        recibidos: rec.rows.map(x => ({ ...x, ts: Number(x.ts) })),
+      });
+    } catch (e) { console.log('mis-pedidos error', e.message); }
   });
 
   socket.on('biz-ubi', async (d) => {
