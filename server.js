@@ -33,6 +33,8 @@ async function initDb() {
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS leido BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS bloqueos ( de TEXT, a TEXT, PRIMARY KEY (de, a) );
     CREATE TABLE IF NOT EXISTS dias_activos ( uid TEXT, dia TEXT, PRIMARY KEY (uid, dia) );
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -412,12 +414,14 @@ io.on('connection', (socket) => {
       const texto = (d.texto || '').trim().slice(0, 200);
       const foto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
       if (!texto && !foto) return;
+      const lat = (typeof d.lat === 'number') ? d.lat : null;
+      const lng = (typeof d.lng === 'number') ? d.lng : null;
       const ts = Date.now();
       const r = await pool.query(
-        `INSERT INTO momentos (de,texto,color,ts,foto) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-        [yo, texto, d.color || 0, ts, foto]);
+        `INSERT INTO momentos (de,texto,color,ts,foto,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [yo, texto, d.color || 0, ts, foto, lat, lng]);
       const n = await nombreDe(yo);
-      const m = { id: r.rows[0].id, de: yo, n, texto, color: d.color || 0, ts, foto, likes: 0, coms: 0, meGusta: false };
+      const m = { id: r.rows[0].id, de: yo, n, texto, color: d.color || 0, ts, foto, lat, lng, likes: 0, coms: 0, meGusta: false };
       sendTo(yo, 'momento-nuevo', m);
       const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
       for (const row of ams.rows) {
@@ -427,12 +431,28 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('momento error', e.message); }
   });
 
+  socket.on('momentos-mapa', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const hace24h = Date.now() - 24 * 3600 * 1000;
+      const r = await pool.query(
+        `SELECT m.id, m.de, u.n, m.texto, m.foto, m.lat, m.lng, m.ts
+         FROM momentos m JOIN usuarios u ON u.id=m.de
+         WHERE m.lat IS NOT NULL AND m.ts >= $2
+           AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
+         ORDER BY m.ts DESC LIMIT 50`, [yo, hace24h]);
+      socket.emit('momentos-mapa', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+    } catch (e) { console.log('momentos-mapa error', e.message); }
+  });
+  
+
   socket.on('feed', async () => {
     try {
       const yo = socketDe[socket.id];
       if (!yo) return;
       const r = await pool.query(
-        `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto,
+        `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto, m.lat, m.lng,
            (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
            (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
            EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
