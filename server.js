@@ -25,6 +25,11 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS comentarios ( id SERIAL PRIMARY KEY, momento_id INT, de TEXT, texto TEXT, padre INT, ts BIGINT );
     ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
     ALTER TABLE negocios ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+    CREATE TABLE IF NOT EXISTS grupos ( id SERIAL PRIMARY KEY, nombre TEXT, creador TEXT, ts BIGINT );
+    CREATE TABLE IF NOT EXISTS grupo_miembros ( grupo INT, uid TEXT, PRIMARY KEY (grupo, uid) );
+    CREATE TABLE IF NOT EXISTS mensajes_grupo ( id SERIAL PRIMARY KEY, grupo INT, de TEXT, texto TEXT, ts BIGINT );
+    CREATE TABLE IF NOT EXISTS sugerencias ( id SERIAL PRIMARY KEY, de TEXT, texto TEXT, ts BIGINT );
+    CREATE TABLE IF NOT EXISTS feat_votos ( feat TEXT, de TEXT, PRIMARY KEY (feat, de) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -41,6 +46,14 @@ function sendTo(userId, event, payload) {
 async function nombreDe(id) {
   const r = await pool.query(`SELECT n FROM usuarios WHERE id=$1`, [id]);
   return r.rowCount ? r.rows[0].n : 'Pata';
+}
+async function gruposDe(id) {
+  const r = await pool.query(
+    `SELECT g.id, g.nombre,
+       (SELECT COUNT(*) FROM grupo_miembros m WHERE m.grupo=g.id)::int AS miembros
+     FROM grupos g JOIN grupo_miembros mm ON mm.grupo=g.id AND mm.uid=$1
+     ORDER BY g.ts DESC`, [id]);
+  return r.rows;
 }
 
 async function crearNotif(para, tipo, texto) {
@@ -107,6 +120,71 @@ async function avisarAmigos(id) {
   for (const row of r.rows) await avisarEstado(row.b);
 }
 
+
+const FEATS = ['llamadas', 'wallet', 'streamer', 'mascotas'];
+
+  async function contarVotos(yo) {
+    const r = await pool.query(`SELECT feat, COUNT(*)::int AS n FROM feat_votos GROUP BY feat`);
+    const mios = await pool.query(`SELECT feat FROM feat_votos WHERE de=$1`, [yo]);
+    const votados = mios.rows.map(x => x.feat);
+    const conteo = {};
+    FEATS.forEach(f => conteo[f] = 0);
+    r.rows.forEach(x => { if (conteo[x.feat] !== undefined) conteo[x.feat] = x.n; });
+    return { conteo, votados };
+  }
+
+  socket.on('votos', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('votos', await contarVotos(yo));
+    } catch (e) {}
+  });
+
+  socket.on('votar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !FEATS.includes(d.feat)) return;
+      await pool.query(`INSERT INTO feat_votos VALUES ($1,$2) ON CONFLICT DO NOTHING`, [d.feat, yo]);
+      socket.emit('votos', await contarVotos(yo));
+    } catch (e) {}
+  });
+
+  socket.on('sugerir', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.texto || !d.texto.trim()) return;
+      await pool.query(`INSERT INTO sugerencias (de,texto,ts) VALUES ($1,$2,$3)`,
+        [yo, d.texto.trim().slice(0, 300), Date.now()]);
+      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
+      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+      socket.emit('aviso', '💡 ¡Gracias! Tu idea alimenta a Boinci 🧡');
+    } catch (e) {}
+  });
+
+  socket.on('sugerencias', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(`SELECT texto, ts FROM sugerencias WHERE de=$1 ORDER BY ts DESC LIMIT 10`, [yo]);
+      socket.emit('sugerencias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+    } catch (e) {}
+  });
+
+  socket.on('momento-borrar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const own = await pool.query(`SELECT de FROM momentos WHERE id=$1`, [d.id]);
+      if (!own.rowCount || own.rows[0].de !== yo) return;
+      await pool.query(`DELETE FROM likes WHERE momento_id=$1`, [d.id]);
+      await pool.query(`DELETE FROM comentarios WHERE momento_id=$1`, [d.id]);
+      await pool.query(`DELETE FROM momentos WHERE id=$1`, [d.id]);
+      socket.emit('momento-borrado', { id: d.id });
+      const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
+      ams.rows.forEach(row => sendTo(row.b, 'momento-borrado', { id: d.id }));
+    } catch (e) { console.log('borrar error', e.message); }
+  });
+  
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/ubi') {
     let body = '';
@@ -227,6 +305,64 @@ io.on('connection', (socket) => {
       sendTo(msg.para, 'chat', m);
       sendTo(yo, 'chat', m);
     } catch (e) { console.log('chat error', e.message); }
+  });
+  socket.on('grupo-crear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.nombre || !d.nombre.trim() || !Array.isArray(d.miembros) || !d.miembros.length) return;
+      const ts = Date.now();
+      const g = await pool.query(
+        `INSERT INTO grupos (nombre,creador,ts) VALUES ($1,$2,$3) RETURNING id`,
+        [d.nombre.trim().slice(0, 30), yo, ts]);
+      const gid = g.rows[0].id;
+      await pool.query(`INSERT INTO grupo_miembros VALUES ($1,$2)`, [gid, yo]);
+      const yoN = await nombreDe(yo);
+      for (const m of d.miembros.slice(0, 20)) {
+        const am = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, m]);
+        if (!am.rowCount) continue;
+        await pool.query(`INSERT INTO grupo_miembros VALUES ($1,$2) ON CONFLICT DO NOTHING`, [gid, m]);
+        sendTo(m, 'grupos', await gruposDe(m));
+        await crearNotif(m, 'grupo', '👥 ' + yoN + ' te agregó al grupo «' + d.nombre.trim() + '»');
+      }
+      socket.emit('grupos', await gruposDe(yo));
+      socket.emit('aviso', '👥 Grupo «' + d.nombre.trim() + '» creado 🎉');
+    } catch (e) { console.log('grupo-crear error', e.message); }
+  });
+
+  socket.on('grupos', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (yo) socket.emit('grupos', await gruposDe(yo));
+    } catch (e) {}
+  });
+
+  socket.on('grupo-chat', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo || !d.texto || !d.texto.trim()) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      if (!soy.rowCount) return;
+      const ts = Date.now();
+      await pool.query(`INSERT INTO mensajes_grupo (grupo,de,texto,ts) VALUES ($1,$2,$3,$4)`,
+        [d.grupo, yo, d.texto.trim().slice(0, 500), ts]);
+      const m = { grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto: d.texto.trim().slice(0, 500), ts };
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
+      miembros.rows.forEach(row => sendTo(row.uid, 'grupo-chat', m));
+    } catch (e) { console.log('grupo-chat error', e.message); }
+  });
+
+  socket.on('grupo-historial', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      if (!soy.rowCount) return;
+      const r = await pool.query(
+        `SELECT mg.de, u.n AS den, mg.texto, mg.ts
+         FROM mensajes_grupo mg JOIN usuarios u ON u.id=mg.de
+         WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo]);
+      socket.emit('grupo-historial', { grupo: d.grupo, lista: r.rows.reverse().map(x => ({ ...x, deN: x.den, ts: Number(x.ts) })) });
+    } catch (e) { console.log('grupo-historial error', e.message); }
   });
 
   socket.on('historial', async (d) => {
