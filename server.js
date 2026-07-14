@@ -445,6 +445,20 @@ io.on('connection', (socket) => {
       socket.emit('momentos-mapa', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
     } catch (e) { console.log('momentos-mapa error', e.message); }
   });
+  socket.on('historias', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const hace24h = Date.now() - 24 * 3600 * 1000;
+      const r = await pool.query(
+        `SELECT m.id, m.de, u.n, m.texto, m.color, m.foto, m.ts
+         FROM momentos m JOIN usuarios u ON u.id=m.de
+         WHERE m.ts >= $2
+           AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
+         ORDER BY m.ts ASC LIMIT 100`, [yo, hace24h]);
+      socket.emit('historias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+    } catch (e) { console.log('historias error', e.message); }
+  });
   
 
   socket.on('feed', async () => {
