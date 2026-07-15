@@ -48,6 +48,9 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_wallet_uid ON wallet_mov(uid, ts);
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS foto TEXT;
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS cita TEXT;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS foto TEXT;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS cita TEXT;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS reaccion TEXT;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -484,7 +487,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT id, de, para, texto, ts, foto, cita, leido FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', { con: d.con, lista: r.rows.reverse().map(x => ({ ...x, ts: Number(x.ts) })) });
@@ -538,13 +541,18 @@ io.on('connection', (socket) => {
   socket.on('grupo-chat', async (d) => {
     try {
       const yo = socketDe[socket.id];
-      if (!yo || !d || !d.grupo || !d.texto || !d.texto.trim()) return;
+      if (!yo || !d || !d.grupo) return;
+      const texto = (d.texto || '').trim().slice(0, 500);
+      const foto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
+      const cita = d.cita ? String(d.cita).slice(0, 140) : null;
+      if (!texto && !foto) return;
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const ts = Date.now();
-      await pool.query(`INSERT INTO mensajes_grupo (grupo,de,texto,ts) VALUES ($1,$2,$3,$4)`,
-        [d.grupo, yo, d.texto.trim().slice(0, 500), ts]);
-      const m = { grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto: d.texto.trim().slice(0, 500), ts };
+      const r = await pool.query(
+        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,foto,cita) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [d.grupo, yo, texto, ts, foto, cita]);
+      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto, ts, foto, cita };
       const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
       miembros.rows.forEach(row => sendTo(row.uid, 'grupo-chat', m));
     } catch (e) { console.log('grupo-chat error', e.message); }
@@ -557,11 +565,63 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-        `SELECT mg.de, u.n AS den, mg.texto, mg.ts
-         FROM mensajes_grupo mg JOIN usuarios u ON u.id=mg.de
+            `SELECT mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita
+            FROM mensajes_grupo mg JOIN usuarios u ON u.id=mg.de
          WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo]);
       socket.emit('grupo-historial', { grupo: d.grupo, lista: r.rows.reverse().map(x => ({ ...x, deN: x.den, ts: Number(x.ts) })) });
     } catch (e) { console.log('grupo-historial error', e.message); }
+  });
+
+  socket.on('gmsg-borrar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const m = await pool.query(`SELECT de, grupo FROM mensajes_grupo WHERE id=$1`, [d.id]);
+      if (!m.rowCount || m.rows[0].de !== yo) return;
+      await pool.query(`UPDATE mensajes_grupo SET texto='🚫 Mensaje eliminado', foto=NULL, cita=NULL WHERE id=$1`, [d.id]);
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [m.rows[0].grupo]);
+      miembros.rows.forEach(row => sendTo(row.uid, 'gmsg-borrado', { id: d.id }));
+    } catch (e) {}
+  });
+
+  socket.on('msg-reaccion', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      const OK = ['🧡', '😂', '😮', '👍'];
+      if (!yo || !d || !d.id || !OK.includes(d.emoji)) return;
+      const m = await pool.query(`SELECT de, para FROM mensajes WHERE id=$1`, [d.id]);
+      if (!m.rowCount || (m.rows[0].de !== yo && m.rows[0].para !== yo)) return;
+      await pool.query(`UPDATE mensajes SET reaccion=$2 WHERE id=$1`, [d.id, d.emoji]);
+      sendTo(m.rows[0].de, 'msg-reaccion', { id: d.id, emoji: d.emoji });
+      sendTo(m.rows[0].para, 'msg-reaccion', { id: d.id, emoji: d.emoji });
+    } catch (e) {}
+  });
+
+  socket.on('grupo-miembros', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      if (!soy.rowCount) return;
+      const r = await pool.query(
+        `SELECT gm.uid, u.n FROM grupo_miembros gm JOIN usuarios u ON u.id=gm.uid WHERE gm.grupo=$1`, [d.grupo]);
+      socket.emit('grupo-miembros', {
+        grupo: d.grupo,
+        lista: r.rows.map(x => ({ id: x.uid, n: x.n, online: !!(online[x.uid] && online[x.uid].size) })),
+      });
+    } catch (e) {}
+  });
+
+  socket.on('grupo-salir', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo) return;
+      await pool.query(`DELETE FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      socket.emit('grupos', await gruposDe(yo));
+      socket.emit('aviso', '👋 Saliste del grupo');
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
+      for (const row of miembros.rows) sendTo(row.uid, 'grupos', await gruposDe(row.uid));
+    } catch (e) {}
   });
 
   socket.on('momento-publicar', async (d) => {
