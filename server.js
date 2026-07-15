@@ -59,6 +59,7 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS dur INT;
     CREATE TABLE IF NOT EXISTS chat_prefs ( uid TEXT, con TEXT, fijado BOOLEAN DEFAULT FALSE, silencio BOOLEAN DEFAULT FALSE, PRIMARY KEY (uid, con) );
     ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS archivado BOOLEAN DEFAULT FALSE;
+    ALTER TABLE negocios ADD COLUMN IF NOT EXISTS abierto BOOLEAN DEFAULT TRUE;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -1282,11 +1283,20 @@ io.on('connection', (socket) => {
   socket.on('negocios-mapa', async () => {
     try {
       const r = await pool.query(
-        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng,
+        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng, n.abierto,
            (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
          FROM negocios n WHERE n.lat IS NOT NULL`);
-      socket.emit('negocios-mapa', r.rows.map(x => ({ ...x, online: !!(online[x.id] && online[x.id].size) })));
+      socket.emit('negocios-mapa', r.rows.map(x => ({ ...x, abierto: x.abierto !== false, online: !!(online[x.id] && online[x.id].size) })));
     } catch (e) { console.log('negocios-mapa error', e.message); }
+  });
+
+  socket.on('biz-abierto', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d) return;
+      await pool.query(`UPDATE negocios SET abierto=$2 WHERE id=$1`, [yo, !!d.on]);
+      socket.emit('aviso', d.on ? '🟢 Tu negocio aparece ABIERTO en el mapa' : '⛔ Tu negocio aparece CERRADO en el mapa');
+    } catch (e) {}
   });
 
   socket.on('escribiendo', (d) => {
