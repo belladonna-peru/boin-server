@@ -51,6 +51,13 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS foto TEXT;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS cita TEXT;
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS reaccion TEXT;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS audio TEXT;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS dur INT;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS plata NUMERIC;
+    ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS editado BOOLEAN DEFAULT FALSE;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS audio TEXT;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS dur INT;
+    CREATE TABLE IF NOT EXISTS chat_prefs ( uid TEXT, con TEXT, fijado BOOLEAN DEFAULT FALSE, silencio BOOLEAN DEFAULT FALSE, PRIMARY KEY (uid, con) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -465,21 +472,118 @@ io.on('connection', (socket) => {
       if (!yo || !msg || !msg.para) return;
       const texto = (msg.texto || '').slice(0, 500);
       const foto = (msg.foto && String(msg.foto).startsWith('https://')) ? String(msg.foto).slice(0, 500) : null;
+      const audio = (msg.audio && String(msg.audio).startsWith('https://')) ? String(msg.audio).slice(0, 500) : null;
+      const dur = audio ? Math.min(Math.round(Number(msg.dur) || 0), 600) : null;
       const cita = msg.cita ? String(msg.cita).slice(0, 140) : null;
-      if (!texto && !foto) return;
+      if (!texto && !foto && !audio) return;
       if (!(await puedenChatear(yo, msg.para))) {
         socket.emit('aviso', 'Primero deben ser patas: envíale una solicitud 🤝');
         return;
       }
       const ts = Date.now();
       const r = await pool.query(
-        `INSERT INTO mensajes (de,para,texto,ts,foto,cita) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [yo, msg.para, texto, ts, foto, cita]);
-      const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, cita, leido: false };
+        `INSERT INTO mensajes (de,para,texto,ts,foto,cita,audio,dur) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [yo, msg.para, texto, ts, foto, cita, audio, dur]);
+      const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, cita, audio, dur, leido: false };
       sendTo(msg.para, 'chat', m);
       sendTo(yo, 'chat', m);
       await avisarEstado(msg.para);
     } catch (e) { console.log('chat error', e.message); }
+  });
+  socket.on('chats', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const est = await estadoDe(yo);
+      const prefs = await pool.query(`SELECT con, fijado, silencio FROM chat_prefs WHERE uid=$1`, [yo]);
+      const P = {}; prefs.rows.forEach(x => { P[x.con] = x; });
+      const lista = [];
+      for (const a of (est.amigos || [])) {
+        const um = await pool.query(
+          `SELECT de, texto, foto, audio, dur, plata, ts, leido FROM mensajes
+           WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1) ORDER BY ts DESC LIMIT 1`, [yo, a.id]);
+        const u = um.rows[0];
+        lista.push({
+          tipo: 'amigo', ...a,
+          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido } : null,
+          fijado: !!(P[a.id] && P[a.id].fijado),
+          silencio: !!(P[a.id] && P[a.id].silencio),
+        });
+      }
+      const gs = await gruposDe(yo);
+      for (const g of (gs || [])) {
+        const um = await pool.query(
+          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts
+           FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
+           WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 1`, [g.id]);
+        const u = um.rows[0];
+        const gk = 'g' + g.id;
+        lista.push({
+          tipo: 'grupo', ...g,
+          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts) } : null,
+          fijado: !!(P[gk] && P[gk].fijado),
+          silencio: !!(P[gk] && P[gk].silencio),
+        });
+      }
+      socket.emit('chats', lista);
+    } catch (e) { console.log('chats error', e.message); }
+  });
+
+  socket.on('chat-pref', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.con) return;
+      await pool.query(
+        `INSERT INTO chat_prefs (uid,con,fijado,silencio) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (uid,con) DO UPDATE SET fijado=$3, silencio=$4`,
+        [yo, String(d.con), !!d.fijado, !!d.silencio]);
+    } catch (e) {}
+  });
+
+  socket.on('chat-plata', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.para) return;
+      const monto = Math.round((Number(d.monto) || 0) * 100) / 100;
+      if (monto <= 0 || monto > 500) { socket.emit('aviso', 'Monto inválido (máx S/ 500 por chat)'); return; }
+      if (!(await puedenChatear(yo, d.para))) { socket.emit('aviso', 'Solo puedes boinear plata a tus patas 🤝'); return; }
+      const saldo = await saldoDe(yo);
+      if (saldo < monto) { socket.emit('aviso', '😅 Saldo insuficiente: tienes S/ ' + saldo.toFixed(2)); return; }
+      const yoN = await nombreDe(yo);
+      const paraN = await nombreDe(d.para);
+      const ts = Date.now();
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'envio',$2,$3,$4)`,
+        [yo, monto, 'Enviaste a ' + paraN + ' 💬', ts]);
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recibido',$2,$3,$4)`,
+        [d.para, monto, 'Te envió ' + yoN + ' 💬🧡', ts]);
+      const r = await pool.query(
+        `INSERT INTO mensajes (de,para,texto,ts,plata) VALUES ($1,$2,'',$3,$4) RETURNING id`,
+        [yo, d.para, ts, monto]);
+      const m = { id: r.rows[0].id, de: yo, para: d.para, texto: '', ts, plata: monto, leido: false };
+      sendTo(yo, 'chat', m);
+      sendTo(d.para, 'chat', m);
+      socket.emit('wallet', await walletDe(yo));
+      sendTo(d.para, 'wallet', await walletDe(d.para));
+      await crearNotif(d.para, 'wallet', '💸 ' + yoN + ' te boineó S/ ' + monto.toFixed(2) + ' por el chat');
+      await avisarEstado(d.para);
+    } catch (e) { console.log('chat-plata error', e.message); }
+  });
+
+  socket.on('msg-editar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id || !d.texto) return;
+      const m = await pool.query(`SELECT de, para, ts, plata FROM mensajes WHERE id=$1`, [d.id]);
+      if (!m.rowCount || m.rows[0].de !== yo || m.rows[0].plata) return;
+      if (Date.now() - Number(m.rows[0].ts) > 15 * 60 * 1000) {
+        socket.emit('aviso', '⏱️ Solo puedes editar mensajes de los últimos 15 min');
+        return;
+      }
+      const texto = String(d.texto).slice(0, 500);
+      await pool.query(`UPDATE mensajes SET texto=$2, editado=TRUE WHERE id=$1`, [d.id, texto]);
+      sendTo(yo, 'msg-editado', { id: d.id, texto });
+      sendTo(m.rows[0].para, 'msg-editado', { id: d.id, texto });
+    } catch (e) {}
   });
 
   socket.on('historial', async (d) => {
@@ -487,10 +591,13 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion, audio, dur, plata, editado FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
-      socket.emit('historial', { con: d.con, lista: r.rows.reverse().map(x => ({ ...x, ts: Number(x.ts) })) });
+      socket.emit('historial', {
+        con: d.con,
+        lista: r.rows.reverse().map(x => ({ ...x, ts: Number(x.ts), plata: x.plata ? Number(x.plata) : null })),
+      });
       await pool.query(`UPDATE mensajes SET leido=TRUE WHERE de=$2 AND para=$1 AND leido=FALSE`, [yo, d.con]);
       sendTo(d.con, 'leidos', { por: yo });
       await avisarEstado(yo);
@@ -544,15 +651,17 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.grupo) return;
       const texto = (d.texto || '').trim().slice(0, 500);
       const foto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
+      const audio = (d.audio && String(d.audio).startsWith('https://')) ? String(d.audio).slice(0, 500) : null;
+      const dur = audio ? Math.min(Math.round(Number(d.dur) || 0), 600) : null;
       const cita = d.cita ? String(d.cita).slice(0, 140) : null;
-      if (!texto && !foto) return;
+      if (!texto && !foto && !audio) return;
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const ts = Date.now();
       const r = await pool.query(
-        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,foto,cita) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [d.grupo, yo, texto, ts, foto, cita]);
-      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto, ts, foto, cita };
+        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,foto,cita,audio,dur) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [d.grupo, yo, texto, ts, foto, cita, audio, dur]);
+      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto, ts, foto, cita, audio, dur };
       const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
       miembros.rows.forEach(row => sendTo(row.uid, 'grupo-chat', m));
     } catch (e) { console.log('grupo-chat error', e.message); }
@@ -565,10 +674,16 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-            `SELECT mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita
-            FROM mensajes_grupo mg JOIN usuarios u ON u.id=mg.de
+        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur
+         FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
          WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo]);
-      socket.emit('grupo-historial', { grupo: d.grupo, lista: r.rows.reverse().map(x => ({ ...x, deN: x.den, ts: Number(x.ts) })) });
+      socket.emit('grupo-historial', {
+        grupo: d.grupo,
+        lista: r.rows.reverse().map(x => ({
+          id: x.id, de: x.de, deN: x.den, texto: x.texto, ts: Number(x.ts),
+          foto: x.foto, cita: x.cita, audio: x.audio, dur: x.dur,
+        })),
+      });
     } catch (e) { console.log('grupo-historial error', e.message); }
   });
 
