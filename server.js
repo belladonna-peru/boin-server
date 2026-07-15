@@ -58,6 +58,7 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS audio TEXT;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS dur INT;
     CREATE TABLE IF NOT EXISTS chat_prefs ( uid TEXT, con TEXT, fijado BOOLEAN DEFAULT FALSE, silencio BOOLEAN DEFAULT FALSE, PRIMARY KEY (uid, con) );
+    ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS archivado BOOLEAN DEFAULT FALSE;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -508,6 +509,7 @@ io.on('connection', (socket) => {
           ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido } : null,
           fijado: !!(P[a.id] && P[a.id].fijado),
           silencio: !!(P[a.id] && P[a.id].silencio),
+          archivado: !!(P[a.id] && P[a.id].archivado),
         });
       }
       const gs = await gruposDe(yo);
@@ -523,10 +525,39 @@ io.on('connection', (socket) => {
           ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts) } : null,
           fijado: !!(P[gk] && P[gk].fijado),
           silencio: !!(P[gk] && P[gk].silencio),
+          archivado: !!(P[gk] && P[gk].archivado),
         });
       }
       socket.emit('chats', lista);
     } catch (e) { console.log('chats error', e.message); }
+  });
+
+  socket.on('chat-media', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.con) return;
+      const f = await pool.query(
+        `SELECT foto FROM mensajes WHERE ((de=$1 AND para=$2) OR (de=$2 AND para=$1)) AND foto IS NOT NULL
+         ORDER BY ts DESC LIMIT 60`, [yo, d.con]);
+      const c = await pool.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE audio IS NOT NULL)::int AS audios,
+                COUNT(*) FILTER (WHERE plata IS NOT NULL)::int AS platas
+         FROM mensajes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.con]);
+      socket.emit('chat-media', { con: d.con, fotos: f.rows.map(x => x.foto), ...c.rows[0] });
+    } catch (e) {}
+  });
+
+  socket.on('chat-vaciar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.con) return;
+      await pool.query(`DELETE FROM mensajes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.con]);
+      sendTo(yo, 'chat-vaciado', { con: d.con });
+      sendTo(d.con, 'chat-vaciado', { con: yo });
+      await avisarEstado(yo);
+      await avisarEstado(d.con);
+    } catch (e) {}
   });
 
   socket.on('chat-pref', async (d) => {
@@ -534,9 +565,9 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       await pool.query(
-        `INSERT INTO chat_prefs (uid,con,fijado,silencio) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (uid,con) DO UPDATE SET fijado=$3, silencio=$4`,
-        [yo, String(d.con), !!d.fijado, !!d.silencio]);
+        `INSERT INTO chat_prefs (uid,con,fijado,silencio,archivado) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (uid,con) DO UPDATE SET fijado=$3, silencio=$4, archivado=$5`,
+        [yo, String(d.con), !!d.fijado, !!d.silencio, !!d.archivado]);
     } catch (e) {}
   });
 
