@@ -64,6 +64,7 @@ async function initDb() {
     ALTER TABLE momentos ADD COLUMN IF NOT EXISTS op2 TEXT;
     CREATE TABLE IF NOT EXISTS enc_votos ( momento INT, de TEXT, op INT, PRIMARY KEY (momento, de) );
     CREATE TABLE IF NOT EXISTS guardados ( uid TEXT, momento INT, ts BIGINT, PRIMARY KEY (uid, momento) );
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto TEXT;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -174,7 +175,7 @@ async function avisarAmigos(id) {
 }
 
 async function perfilDe(yo) {
-  const u = await pool.query(`SELECT n, usuario, bio, tipo FROM usuarios WHERE id=$1`, [yo]);
+  const u = await pool.query(`SELECT n, usuario, bio, tipo, foto FROM usuarios WHERE id=$1`, [yo]);
   const pa = await pool.query(`SELECT COUNT(*)::int AS c FROM amistades WHERE a=$1`, [yo]);
   const mo = await pool.query(`SELECT COUNT(*)::int AS c FROM momentos WHERE de=$1`, [yo]);
   const li = await pool.query(
@@ -185,6 +186,7 @@ async function perfilDe(yo) {
     bio: u.rows[0] ? (u.rows[0].bio || '') : '',
     tipo: u.rows[0] ? (u.rows[0].tipo || 'personal') : 'personal',
     patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
+    foto: u.rows[0] ? u.rows[0].foto : null,
   };
 }
 
@@ -1077,7 +1079,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.id) return;
       const u = await pool.query(
-        `SELECT u.n, u.usuario, u.bio, u.tipo, ng.nombre AS bizn, ng.descr AS bizd, ng.cat AS bizc
+        `SELECT u.n, u.usuario, u.bio, u.tipo, u.foto, ng.nombre AS bizn, ng.descr AS bizd, ng.cat AS bizc
          FROM usuarios u LEFT JOIN negocios ng ON ng.id=u.id WHERE u.id=$1`, [d.id]);
       if (!u.rowCount) return;
       const x = u.rows[0];
@@ -1095,7 +1097,7 @@ io.on('connection', (socket) => {
         moms = r.rows.map(m => ({ ...m, ts: Number(m.ts) }));
       }
       socket.emit('perfil-de', {
-        id: d.id, n: x.n, usuario: x.usuario, bio: x.bio || '', tipo: x.tipo || 'personal',
+        id: d.id, n: x.n, usuario: x.usuario, bio: x.bio || '', tipo: x.tipo || 'personal', foto: x.foto || null,
         biz: x.bizn ? { nombre: x.bizn, descr: x.bizd, cat: x.bizc } : null,
         patas: pa.rows[0].c, momentos: mo.rows[0].c, likes: li.rows[0].c,
         esAmigo, pendiente: !!pe.rowCount,
@@ -1103,6 +1105,16 @@ io.on('connection', (socket) => {
         moms,
       });
     } catch (e) { console.log('perfil-de error', e.message); }
+  });
+
+  socket.on('foto-perfil', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.url || !String(d.url).startsWith('https://')) return;
+      await pool.query(`UPDATE usuarios SET foto=$2 WHERE id=$1`, [yo, String(d.url).slice(0, 500)]);
+      socket.emit('perfil', await perfilDe(yo));
+      socket.emit('aviso', '📸 Foto de perfil actualizada');
+    } catch (e) {}
   });
 
   // ===== WALLET (billetera digital) =====
