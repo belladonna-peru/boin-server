@@ -60,6 +60,10 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS chat_prefs ( uid TEXT, con TEXT, fijado BOOLEAN DEFAULT FALSE, silencio BOOLEAN DEFAULT FALSE, PRIMARY KEY (uid, con) );
     ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS archivado BOOLEAN DEFAULT FALSE;
     ALTER TABLE negocios ADD COLUMN IF NOT EXISTS abierto BOOLEAN DEFAULT TRUE;
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS op1 TEXT;
+    ALTER TABLE momentos ADD COLUMN IF NOT EXISTS op2 TEXT;
+    CREATE TABLE IF NOT EXISTS enc_votos ( momento INT, de TEXT, op INT, PRIMARY KEY (momento, de) );
+    CREATE TABLE IF NOT EXISTS guardados ( uid TEXT, momento INT, ts BIGINT, PRIMARY KEY (uid, momento) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -275,6 +279,80 @@ io.on('connection', (socket) => {
       await avisarEstado(d.para);
       socket.emit('aviso', '⚡ ¡Boin enviado! ' + (await nombreDe(d.para)) + ' sabe que vas en camino');
     } catch (e) { console.log('boinear error', e.message); }
+  });
+
+  // ---- guardar / quitar de guardados ----
+  socket.on('guardar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const ya = await pool.query(`SELECT 1 FROM guardados WHERE uid=$1 AND momento=$2`, [yo, d.id]);
+      if (ya.rowCount) await pool.query(`DELETE FROM guardados WHERE uid=$1 AND momento=$2`, [yo, d.id]);
+      else await pool.query(`INSERT INTO guardados VALUES ($1,$2,$3)`, [yo, d.id, Date.now()]);
+      socket.emit('guardado', { id: d.id, on: !ya.rowCount });
+    } catch (e) {}
+  });
+
+  socket.on('guardados', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(
+        `SELECT m.id, m.de, u.n, m.texto, m.color, m.foto, m.ts
+         FROM guardados g JOIN momentos m ON m.id=g.momento LEFT JOIN usuarios u ON u.id=m.de
+         WHERE g.uid=$1 ORDER BY g.ts DESC LIMIT 50`, [yo]);
+      socket.emit('guardados', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
+    } catch (e) {}
+  });
+
+  // ---- quién dio like ----
+  socket.on('likes-de', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const r = await pool.query(
+        `SELECT u.id, u.n FROM likes l JOIN usuarios u ON u.id=l.de WHERE l.momento_id=$1 LIMIT 50`, [d.id]);
+      socket.emit('likes-de', { id: d.id, lista: r.rows });
+    } catch (e) {}
+  });
+
+  // ---- encuestas ----
+  socket.on('encuesta-set', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id || !d.op1 || !d.op2) return;
+      await pool.query(`UPDATE momentos SET op1=$2, op2=$3 WHERE id=$1 AND de=$4`,
+        [d.id, String(d.op1).slice(0, 40), String(d.op2).slice(0, 40), yo]);
+    } catch (e) {}
+  });
+
+  socket.on('encuestas', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(
+        `SELECT m.id, m.op1, m.op2,
+           (SELECT COUNT(*) FROM enc_votos v WHERE v.momento=m.id AND v.op=1)::int AS v1,
+           (SELECT COUNT(*) FROM enc_votos v WHERE v.momento=m.id AND v.op=2)::int AS v2,
+           (SELECT op FROM enc_votos v WHERE v.momento=m.id AND v.de=$1) AS mivoto
+         FROM momentos m WHERE m.op1 IS NOT NULL AND m.ts > $2`, [yo, Date.now() - 86400000]);
+      socket.emit('encuestas', r.rows);
+    } catch (e) {}
+  });
+
+  socket.on('encuesta-votar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const op = d.op === 2 ? 2 : 1;
+      await pool.query(
+        `INSERT INTO enc_votos (momento,de,op) VALUES ($1,$2,$3)
+         ON CONFLICT (momento,de) DO UPDATE SET op=$3`, [d.id, yo, op]);
+      const c = await pool.query(
+        `SELECT (SELECT COUNT(*) FROM enc_votos WHERE momento=$1 AND op=1)::int AS v1,
+                (SELECT COUNT(*) FROM enc_votos WHERE momento=$1 AND op=2)::int AS v2`, [d.id]);
+      io.emit('encuesta', { id: d.id, v1: c.rows[0].v1, v2: c.rows[0].v2 });
+    } catch (e) {}
   });
 
   socket.on('punto', async (d) => {
@@ -866,7 +944,7 @@ io.on('connection', (socket) => {
       if (!own.rowCount || own.rows[0].de !== yo) return;
       await pool.query(`DELETE FROM likes WHERE momento_id=$1`, [d.id]);
       await pool.query(`DELETE FROM comentarios WHERE momento_id=$1`, [d.id]);
-      await pool.query(`DELETE FROM momentos WHERE id=$1`, [d.id]);
+      await pool.query(`DELETE FROM momentos WHERE ts < $1 AND id NOT IN (SELECT momento FROM guardados)`, [d.id]);
       socket.emit('momento-borrado', { id: d.id });
       const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
       ams.rows.forEach(row => sendTo(row.b, 'momento-borrado', { id: d.id }));
