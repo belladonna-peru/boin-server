@@ -65,6 +65,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS enc_votos ( momento INT, de TEXT, op INT, PRIMARY KEY (momento, de) );
     CREATE TABLE IF NOT EXISTS guardados ( uid TEXT, momento INT, ts BIGINT, PRIMARY KEY (uid, momento) );
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS animal TEXT DEFAULT 'cuy';
   `);
   console.log('Base de datos lista ✅');
 }
@@ -1114,6 +1115,30 @@ io.on('connection', (socket) => {
       await pool.query(`UPDATE usuarios SET foto=$2 WHERE id=$1`, [yo, String(d.url).slice(0, 500)]);
       socket.emit('perfil', await perfilDe(yo));
       socket.emit('aviso', '📸 Foto de perfil actualizada');
+    } catch (e) {}
+  });
+
+  socket.on('animal', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      const OK = ['cuy', 'pinguino', 'tiburon', 'leon', 'huron', 'cocodrilo'];
+      if (!yo || !d || !OK.includes(d.k)) return;
+      await pool.query(`UPDATE usuarios SET animal=$2 WHERE id=$1`, [yo, d.k]);
+      socket.emit('aviso', '🐾 ¡Nuevo compañero elegido! Tus patas ya lo ven en su mapa');
+    } catch (e) {}
+  });
+
+  socket.on('animales', async () => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const r = await pool.query(
+        `SELECT u.id, u.animal FROM amistades a JOIN usuarios u ON u.id=a.b WHERE a.a=$1`, [yo]);
+      const m = {};
+      r.rows.forEach(x => { m[x.id] = x.animal || 'cuy'; });
+      const me = await pool.query(`SELECT animal FROM usuarios WHERE id=$1`, [yo]);
+      m[yo] = (me.rows[0] && me.rows[0].animal) || 'cuy';
+      socket.emit('animales', m);
     } catch (e) {}
   });
 
