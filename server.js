@@ -1348,7 +1348,7 @@ io.on('connection', (socket) => {
       await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recibido',$2,$3,$4)`,
         [negocio, total, 'Cobro pedido #' + d.id + ' de ' + yoN + ' 💳', ts]);
       await pool.query(`UPDATE pedidos SET pagado=TRUE WHERE id=$1`, [d.id]);
-      const texto = '💳 Pagué el pedido #' + d.id + ' con mi Wallet Boin — S/ ' + total.toFixed(2);
+      const texto = '💳 Pagué el pedido #' + d.id + ' con mi Wallet Toka — S/ ' + total.toFixed(2);
       await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, negocio, texto, ts]);
       sendTo(negocio, 'chat', { de: yo, para: negocio, texto, ts });
       sendTo(yo, 'chat', { de: yo, para: negocio, texto, ts });
@@ -1389,7 +1389,7 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.lat || !d.lng) return;
       const r = await pool.query(`UPDATE negocios SET lat=$2, lng=$3 WHERE id=$1`, [yo, d.lat, d.lng]);
       if (r.rowCount) {
-        socket.emit('aviso', '📍 ¡Tu local quedó fijado en el mapa de Boin!');
+        socket.emit('aviso', '📍 ¡Tu local quedó fijado en el mapa de Toka!');
         socket.emit('biz-mio', await bizMio(yo));
       }
     } catch (e) { console.log('biz-ubi error', e.message); }
