@@ -588,6 +588,26 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('chat error', e.message); }
   });
 
+  socket.on('qr-agregar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id || d.id === yo) return;
+      const existe = await pool.query(`SELECT 1 FROM usuarios WHERE id=$1`, [d.id]);
+      if (!existe.rowCount) { socket.emit('aviso', 'Ese código no es de TOKA 🤔'); return; }
+      if (await hayBloqueo(yo, d.id)) return;
+      const ya = await pool.query(`SELECT 1 FROM amistades WHERE a=$1 AND b=$2`, [yo, d.id]);
+      if (ya.rowCount) { socket.emit('aviso', '¡Ya son patas! 🧡'); return; }
+      await pool.query(`INSERT INTO amistades VALUES ($1,$2),($2,$1) ON CONFLICT DO NOTHING`, [yo, d.id]);
+      await pool.query(`INSERT INTO comparto VALUES ($1,$2),($2,$1) ON CONFLICT DO NOTHING`, [yo, d.id]);
+      await pool.query(`DELETE FROM solicitudes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`, [yo, d.id]);
+      const yoN = await nombreDe(yo), otroN = await nombreDe(d.id);
+      await crearNotif(d.id, 'pata', '🤝 ' + yoN + ' escaneó tu huella: ¡ya son patas!');
+      await avisarEstado(yo);
+      await avisarEstado(d.id);
+      socket.emit('aviso', '🤝 ¡Listo! Tú y ' + otroN + ' ya son patas');
+    } catch (e) { console.log('qr-agregar error', e.message); }
+  });
+
   socket.on('chats', async () => {
     try {
       const yo = socketDe[socket.id];
