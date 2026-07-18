@@ -288,8 +288,7 @@ io.on('connection', (socket) => {
       await avisarEstado(d.para);
       socket.emit('aviso', '⚡ ¡Boin enviado! ' + (await nombreDe(d.para)) + ' sabe que vas en camino');
     } catch (e) { console.log('boinear error', e.message); }
-  });});
-
+  });
   // ---- guardar / quitar de guardados ----
   socket.on('guardar', async (d) => {
     try {
@@ -581,8 +580,6 @@ io.on('connection', (socket) => {
       await avisarEstado(msg.para);
     } catch (e) { console.log('chat error', e.message); }
   });
-
-  socket.on('chat-location', async (d) => {
 
   socket.on('chats', async () => {
     try {
@@ -1006,7 +1003,7 @@ io.on('connection', (socket) => {
       if (!own.rowCount || own.rows[0].de !== yo) return;
       await pool.query(`DELETE FROM likes WHERE momento_id=$1`, [d.id]);
       await pool.query(`DELETE FROM comentarios WHERE momento_id=$1`, [d.id]);
-      await pool.query(`DELETE FROM momentos WHERE ts < $1 AND id NOT IN (SELECT momento FROM guardados)`, [d.id]);
+      await pool.query(`DELETE FROM momentos WHERE id=$1`, [d.id]);
       socket.emit('momento-borrado', { id: d.id });
       const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
       ams.rows.forEach(row => sendTo(row.b, 'momento-borrado', { id: d.id }));
