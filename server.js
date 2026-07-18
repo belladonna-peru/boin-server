@@ -785,6 +785,51 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('plan-votar error', e.message); }
   });
 
+  // ===== FASE 6: VAMOS JUNTOS =====
+  socket.on('encamino', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const yoN = await nombreDe(yo);
+      if (String(d.id).startsWith('plan')) {
+        const msgId = Number(String(d.id).slice(4));
+        const m = await pool.query(`SELECT grupo, plan FROM mensajes_grupo WHERE id=$1`, [msgId]);
+        if (!m.rowCount) return;
+        const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [m.rows[0].grupo]);
+        for (const row of miembros.rows) {
+          if (row.uid === yo) continue;
+          sendTo(row.uid, 'pata-rumbo', { n: yoN, estado: 'encamino' });
+          await crearNotif(row.uid, 'punto', '🏃 ' + yoN + ' ya va en camino a «' + m.rows[0].plan + '»');
+        }
+      } else {
+        sendTo(d.id, 'pata-rumbo', { n: yoN, estado: 'encamino' });
+        await crearNotif(d.id, 'punto', '🏃 ' + yoN + ' va en camino a tu punto de encuentro');
+      }
+    } catch (e) { console.log('encamino error', e.message); }
+  });
+
+  socket.on('llegue', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const yoN = await nombreDe(yo);
+      if (String(d.id).startsWith('plan')) {
+        const msgId = Number(String(d.id).slice(4));
+        const m = await pool.query(`SELECT grupo, plan FROM mensajes_grupo WHERE id=$1`, [msgId]);
+        if (!m.rowCount) return;
+        const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [m.rows[0].grupo]);
+        for (const row of miembros.rows) {
+          if (row.uid === yo) continue;
+          sendTo(row.uid, 'pata-rumbo', { n: yoN, estado: 'llego' });
+          await crearNotif(row.uid, 'punto', '🎉 ' + yoN + ' YA LLEGÓ a «' + m.rows[0].plan + '»');
+        }
+      } else {
+        sendTo(d.id, 'pata-rumbo', { n: yoN, estado: 'llego' });
+        await crearNotif(d.id, 'punto', '🎉 ' + yoN + ' YA LLEGÓ a tu punto de encuentro');
+      }
+    } catch (e) { console.log('llegue error', e.message); }
+  });
+
   socket.on('grupo-crear', async (d) => {
     try {
       const yo = socketDe[socket.id];
