@@ -532,6 +532,40 @@ io.on('connection', (socket) => {
       socket.emit('zonas', zonas);
     } catch (e) {}
   });
+  socket.on('termometro', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo) return;
+      const lat = Number(d && d.lat), lng = Number(d && d.lng);
+      const tengoUbi = !isNaN(lat) && !isNaN(lng);
+      const dist = (aLat, aLng, bLat, bLng) => {
+        const R = 6371000, rad = Math.PI / 180;
+        const dLat = (bLat - aLat) * rad, dLng = (bLng - aLng) * rad;
+        const x = Math.sin(dLat / 2) ** 2 + Math.cos(aLat * rad) * Math.cos(bLat * rad) * Math.sin(dLng / 2) ** 2;
+        return Math.round(R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x)));
+      };
+      const ahora = Date.now();
+      const celdas = {};
+      Object.values(ubiCache).forEach(u => {
+        if (ahora - u.ts > 120000) return;
+        const k = Math.round(u.lat / 0.003) + '_' + Math.round(u.lng / 0.003);
+        celdas[k] = celdas[k] || { lat: 0, lng: 0, n: 0 };
+        celdas[k].lat += u.lat; celdas[k].lng += u.lng; celdas[k].n++;
+      });
+      let zonas = Object.values(celdas).filter(c => c.n >= 2)
+        .map(c => ({ lat: c.lat / c.n, lng: c.lng / c.n, n: c.n }));
+      if (tengoUbi) zonas = zonas.map(z => ({ ...z, dist: dist(lat, lng, z.lat, z.lng) })).filter(z => z.dist < 5000);
+      zonas.sort((a, b) => b.n - a.n);
+      const m = await pool.query(`SELECT lat, lng FROM momentos WHERE ts > $1 AND lat IS NOT NULL`, [ahora - 3 * 3600 * 1000]);
+      const momentos = tengoUbi ? m.rows.filter(x => dist(lat, lng, x.lat, x.lng) < 3000).length : m.rowCount;
+      const ng = await pool.query(`SELECT lat, lng FROM negocios WHERE abierto=TRUE AND lat IS NOT NULL`);
+      const abiertos = tengoUbi ? ng.rows.filter(x => dist(lat, lng, x.lat, x.lng) < 3000).length : ng.rowCount;
+      const am = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
+      const patasOnline = am.rows.filter(r => online[r.b] && online[r.b].size).length;
+      const nivel = Math.min(100, zonas.reduce((s, z) => s + z.n * 12, 0) + momentos * 8 + abiertos * 4 + patasOnline * 10);
+      socket.emit('termometro', { nivel, zonas: zonas.slice(0, 3), momentos, abiertos, patasOnline });
+    } catch (e) { console.log('termometro error', e.message); }
+  });
 
   socket.on('diario', async () => {
     try {
