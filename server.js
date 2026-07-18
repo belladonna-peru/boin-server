@@ -76,6 +76,9 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS plan_hora TEXT;
     CREATE TABLE IF NOT EXISTS plan_votos ( msg INT, uid TEXT, voy BOOLEAN, PRIMARY KEY (msg, uid) );
     CREATE TABLE IF NOT EXISTS resenas ( negocio TEXT, de TEXT, estrellas INT, texto TEXT, ts BIGINT, PRIMARY KEY (negocio, de) );
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS chancha TEXT;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS chancha_meta NUMERIC;
+    CREATE TABLE IF NOT EXISTS chancha_aportes ( msg INT, uid TEXT, monto NUMERIC, ts BIGINT, PRIMARY KEY (msg, uid) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -595,12 +598,12 @@ io.on('connection', (socket) => {
       const lista = [];
       for (const a of (est.amigos || [])) {
         const um = await pool.query(
-          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, leido, mg.plan, mg.plan_hora FROM mensajes
+          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, leido, mg.plan , mg.plan_hora FROM mensajes
            WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1) ORDER BY ts DESC LIMIT 1`, [yo, a.id]);
         const u = um.rows[0];
         lista.push({
           tipo: 'amigo', ...a,
-          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, plan_hora: u.plan_hora } : null,
+          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, chancha: u.chancha, chancha_meta: u.chancha_meta,   plan_hora: u.plan_hora } : null,
           fijado: !!(P[a.id] && P[a.id].fijado),
           silencio: !!(P[a.id] && P[a.id].silencio),
           archivado: !!(P[a.id] && P[a.id].archivado),
@@ -609,14 +612,14 @@ io.on('connection', (socket) => {
       const gs = await gruposDe(yo);
       for (const g of (gs || [])) {
         const um = await pool.query(
-          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.cobro, mg.plan, mg.plan_hora
+          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.cobro, mg.plan, mg.chancha, mg.chancha_meta, mg.plan_hora
            FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
            WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 1`, [g.id]);
         const u = um.rows[0];
         const gk = 'g' + g.id;
         lista.push({
           tipo: 'grupo', ...g,
-          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, plan_hora: u.plan_hora } : null,
+          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, chancha: u.chancha, chancha_meta: u.chancha_meta, plan_hora: u.plan_hora } : null,
           fijado: !!(P[gk] && P[gk].fijado),
           silencio: !!(P[gk] && P[gk].silencio),
           archivado: !!(P[gk] && P[gk].archivado),
@@ -785,6 +788,61 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('plan-votar error', e.message); }
   });
 
+  socket.on('chancha-crear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo || !d.motivo || !d.motivo.trim()) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      if (!soy.rowCount) return;
+      const meta = Math.min(2000, Math.max(0, Math.round((Number(d.meta) || 0) * 100) / 100)) || null;
+      const motivo = String(d.motivo).trim().slice(0, 60);
+      const ts = Date.now();
+      const r = await pool.query(
+        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,chancha,chancha_meta) VALUES ($1,$2,'',$3,$4,$5) RETURNING id`,
+        [d.grupo, yo, ts, motivo, meta]);
+      const yoN = await nombreDe(yo);
+      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: yoN, texto: '', ts, chancha: motivo, chanchaMeta: meta, chanchaTotal: 0, miAporte: 0 };
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
+      for (const row of miembros.rows) {
+        sendTo(row.uid, 'grupo-chat', m);
+        if (row.uid !== yo) await crearNotif(row.uid, 'wallet', '🐷 ' + yoN + ' abrió una chanchita: «' + motivo + '»' + (meta ? ' — meta S/ ' + meta.toFixed(2) : ''));
+      }
+    } catch (e) { console.log('chancha-crear error', e.message); }
+  });
+
+  socket.on('chancha-aportar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const monto = Math.round((Number(d.monto) || 0) * 100) / 100;
+      if (monto <= 0 || monto > 500) { socket.emit('aviso', 'Monto inválido (máx S/ 500 por aporte)'); return; }
+      const m = await pool.query(`SELECT grupo, de, chancha FROM mensajes_grupo WHERE id=$1`, [d.id]);
+      if (!m.rowCount || !m.rows[0].chancha) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [m.rows[0].grupo, yo]);
+      if (!soy.rowCount) return;
+      const duenio = m.rows[0].de;
+      if (duenio === yo) { socket.emit('aviso', 'La chanchita es tuya: los aportes llegan directo a tu Wallet 🐷'); return; }
+      const saldo = await saldoDe(yo);
+      if (saldo < monto) { socket.emit('aviso', '😅 Saldo insuficiente: tienes S/ ' + saldo.toFixed(2)); return; }
+      const yoN = await nombreDe(yo);
+      const ts = Date.now();
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'envio',$2,$3,$4)`,
+        [yo, monto, '🐷 Aporte a «' + m.rows[0].chancha + '»', ts]);
+      await pool.query(`INSERT INTO wallet_mov (uid,tipo,monto,detalle,ts) VALUES ($1,'recibido',$2,$3,$4)`,
+        [duenio, monto, '🐷 ' + yoN + ' aportó a «' + m.rows[0].chancha + '»', ts]);
+      await pool.query(
+        `INSERT INTO chancha_aportes (msg,uid,monto,ts) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (msg,uid) DO UPDATE SET monto = chancha_aportes.monto + $3, ts=$4`,
+        [d.id, yo, monto, ts]);
+      const tot = await pool.query(`SELECT COALESCE(SUM(monto),0)::float AS total, COUNT(*)::int AS n FROM chancha_aportes WHERE msg=$1`, [d.id]);
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [m.rows[0].grupo]);
+      miembros.rows.forEach(row => sendTo(row.uid, 'chancha-total', { id: d.id, total: tot.rows[0].total, aportantes: tot.rows[0].n }));
+      socket.emit('wallet', await walletDe(yo));
+      sendTo(duenio, 'wallet', await walletDe(duenio));
+      await crearNotif(duenio, 'wallet', '🐷 ' + yoN + ' aportó S/ ' + monto.toFixed(2) + ' a tu chanchita');
+    } catch (e) { console.log('chancha-aportar error', e.message); }
+  });
+
   // ===== FASE 6: VAMOS JUNTOS =====
   socket.on('encamino', async (d) => {
     try {
@@ -937,18 +995,23 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng, mg.plan, mg.plan_hora,
+        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng, mg.plan, mg.plan_hora, mg.chancha, mg.chancha_meta,
            (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND v.voy)::int AS si,
            (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND NOT v.voy)::int AS no,
-           (SELECT voy FROM plan_votos v WHERE v.msg=mg.id AND v.uid=$2) AS mivoto
+           (SELECT voy FROM plan_votos v WHERE v.msg=mg.id AND v.uid=$2) AS mivoto,
+           (SELECT COALESCE(SUM(monto),0)::float FROM chancha_aportes ca WHERE ca.msg=mg.id) AS chancha_total,
+           (SELECT COUNT(*)::int FROM chancha_aportes ca WHERE ca.msg=mg.id) AS aportantes,
+           (SELECT monto::float FROM chancha_aportes ca WHERE ca.msg=mg.id AND ca.uid=$2) AS mi_aporte
          FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
-         WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo, yo]); 
+         WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo, yo]);
       socket.emit('grupo-historial', {
         grupo: d.grupo,
         lista: r.rows.reverse().map(x => ({
-          plan: x.plan, plan_hora: x.plan_hora, si: x.si, no: x.no, mivoto: x.mivoto,
           id: x.id, de: x.de, deN: x.den, texto: x.texto, ts: Number(x.ts),
-          foto: x.foto, cita: x.cita, audio: x.audio, dur: x.dur, lat: x.lat, lng: x.lng, 
+          foto: x.foto, cita: x.cita, audio: x.audio, dur: x.dur, lat: x.lat, lng: x.lng,
+          plan: x.plan, plan_hora: x.plan_hora, si: x.si, no: x.no, mivoto: x.mivoto,
+          chancha: x.chancha, chanchaMeta: x.chancha_meta ? Number(x.chancha_meta) : null,
+          chanchaTotal: x.chancha_total, aportantes: x.aportantes, miAporte: x.mi_aporte ? Number(x.mi_aporte) : 0,
         })),
       });
     } catch (e) { console.log('grupo-historial error', e.message); }
