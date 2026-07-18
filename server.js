@@ -288,7 +288,7 @@ io.on('connection', (socket) => {
       await avisarEstado(d.para);
       socket.emit('aviso', '⚡ ¡Boin enviado! ' + (await nombreDe(d.para)) + ' sabe que vas en camino');
     } catch (e) { console.log('boinear error', e.message); }
-  });
+  });});
 
   // ---- guardar / quitar de guardados ----
   socket.on('guardar', async (d) => {
