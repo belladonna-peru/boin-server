@@ -75,6 +75,7 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS plan TEXT;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS plan_hora TEXT;
     CREATE TABLE IF NOT EXISTS plan_votos ( msg INT, uid TEXT, voy BOOLEAN, PRIMARY KEY (msg, uid) );
+    CREATE TABLE IF NOT EXISTS resenas ( negocio TEXT, de TEXT, estrellas INT, texto TEXT, ts BIGINT, PRIMARY KEY (negocio, de) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -1314,6 +1315,65 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('biz-crear error', e.message); }
   });
 
+  socket.on('pedido-repetir', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const p = await pool.query(`SELECT de, negocio, detalle, total::float FROM pedidos WHERE id=$1`, [d.id]);
+      if (!p.rowCount || p.rows[0].de !== yo) return;
+      const negocio = p.rows[0].negocio, detalle = p.rows[0].detalle, total = p.rows[0].total;
+      const ts = Date.now();
+      const np = await pool.query(
+        `INSERT INTO pedidos (de,negocio,detalle,total,ts) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [yo, negocio, detalle, total, ts]);
+      const pid = np.rows[0].id;
+      const texto = '🛍️ PEDIDO #' + pid + ': ' + detalle + ' — Total S/ ' + total.toFixed(2) + ' 🔁';
+      await pool.query(`INSERT INTO mensajes (de,para,texto,ts) VALUES ($1,$2,$3,$4)`, [yo, negocio, texto, ts]);
+      sendTo(negocio, 'chat', { de: yo, para: negocio, texto, ts });
+      sendTo(yo, 'chat', { de: yo, para: negocio, texto, ts });
+      await crearNotif(negocio, 'pedido', '🔁 ' + (await nombreDe(yo)) + ' repitió su pedido — S/ ' + total.toFixed(2));
+      socket.emit('pedidos-mios', await pedidosDe(yo));
+      sendTo(negocio, 'pedidos-negocio', await pedidosNegocio(negocio));
+      await avisarEstado(yo);
+      await avisarEstado(negocio);
+      socket.emit('aviso', '🔁 ¡Pedido repetido! Es el #' + pid);
+    } catch (e) { console.log('pedido-repetir error', e.message); }
+  });
+
+  socket.on('resenas', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const r = await pool.query(
+        `SELECT r.de, u.n, r.estrellas, r.texto, r.ts FROM resenas r JOIN usuarios u ON u.id=r.de
+         WHERE r.negocio=$1 ORDER BY r.ts DESC LIMIT 30`, [d.id]);
+      const puedo = await pool.query(`SELECT 1 FROM pedidos WHERE de=$1 AND negocio=$2 LIMIT 1`, [yo, d.id]);
+      const mia = await pool.query(`SELECT estrellas, texto FROM resenas WHERE negocio=$1 AND de=$2`, [d.id, yo]);
+      socket.emit('resenas', {
+        id: d.id,
+        lista: r.rows.map(x => ({ ...x, ts: Number(x.ts) })),
+        puedo: !!puedo.rowCount,
+        mia: mia.rowCount ? mia.rows[0] : null,
+      });
+    } catch (e) { console.log('resenas error', e.message); }
+  });
+
+  socket.on('resena-poner', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.negocio) return;
+      const est = Math.min(5, Math.max(1, Math.round(Number(d.estrellas) || 0)));
+      const pidio = await pool.query(`SELECT 1 FROM pedidos WHERE de=$1 AND negocio=$2 LIMIT 1`, [yo, d.negocio]);
+      if (!pidio.rowCount) { socket.emit('aviso', '🔒 Solo pueden reseñar quienes ya pidieron aquí (huella verificada)'); return; }
+      await pool.query(
+        `INSERT INTO resenas (negocio,de,estrellas,texto,ts) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (negocio,de) DO UPDATE SET estrellas=$3, texto=$4, ts=$5`,
+        [d.negocio, yo, est, String(d.texto || '').slice(0, 200), Date.now()]);
+      await crearNotif(d.negocio, 'resena', '⭐ ' + (await nombreDe(yo)) + ' dejó una reseña de ' + est + ' ⭐ con huella verificada');
+      socket.emit('aviso', '⭐ ¡Gracias! Tu reseña lleva huella verificada 🧡');
+    } catch (e) { console.log('resena error', e.message); }
+  });
+
   socket.on('biz-mio', async () => {
     try {
       const yo = socketDe[socket.id];
@@ -1360,7 +1420,9 @@ io.on('connection', (socket) => {
     try {
       const r = await pool.query(
         `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng,
-           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
+           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos,
+           (SELECT ROUND(AVG(estrellas),1) FROM resenas r WHERE r.negocio=n.id)::float AS rating,
+           (SELECT COUNT(*) FROM resenas r WHERE r.negocio=n.id)::int AS nresenas
          FROM negocios n ORDER BY n.nombre`);
       socket.emit('negocios', r.rows.map(x => ({ ...x, online: !!(online[x.id] && online[x.id].size) })));
     } catch (e) { console.log('negocios error', e.message); }
@@ -1506,9 +1568,10 @@ io.on('connection', (socket) => {
   socket.on('negocios-mapa', async () => {
     try {
       const r = await pool.query(
-        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng, n.abierto,
-           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos
-         FROM negocios n WHERE n.lat IS NOT NULL`);
+        `(SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos,
+           (SELECT ROUND(AVG(estrellas),1) FROM resenas r WHERE r.negocio=n.id)::float AS rating,
+           (SELECT COUNT(*) FROM resenas r WHERE r.negocio=n.id)::int AS nresenas
+         FROM negocios n ORDER BY n.nombre ASC WHERE n.lat IS NOT NULL`);
       socket.emit('negocios-mapa', r.rows.map(x => ({ ...x, abierto: x.abierto !== false, online: !!(online[x.id] && online[x.id].size) })));
     } catch (e) { console.log('negocios-mapa error', e.message); }
   });
