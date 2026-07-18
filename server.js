@@ -72,6 +72,9 @@ async function initDb() {
     ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS cobrado BOOLEAN DEFAULT FALSE;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS plan TEXT;
+    ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS plan_hora TEXT;
+    CREATE TABLE IF NOT EXISTS plan_votos ( msg INT, uid TEXT, voy BOOLEAN, PRIMARY KEY (msg, uid) );
   `);
   console.log('Base de datos lista ✅');
 }
@@ -591,12 +594,12 @@ io.on('connection', (socket) => {
       const lista = [];
       for (const a of (est.amigos || [])) {
         const um = await pool.query(
-          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, leido FROM mensajes
+          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, leido, mg.plan, mg.plan_hora FROM mensajes
            WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1) ORDER BY ts DESC LIMIT 1`, [yo, a.id]);
         const u = um.rows[0];
         lista.push({
           tipo: 'amigo', ...a,
-          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null } : null,
+          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, plan_hora: u.plan_hora } : null,
           fijado: !!(P[a.id] && P[a.id].fijado),
           silencio: !!(P[a.id] && P[a.id].silencio),
           archivado: !!(P[a.id] && P[a.id].archivado),
@@ -605,14 +608,14 @@ io.on('connection', (socket) => {
       const gs = await gruposDe(yo);
       for (const g of (gs || [])) {
         const um = await pool.query(
-          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.cobro 
+          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.cobro, mg.plan, mg.plan_hora
            FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
            WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 1`, [g.id]);
         const u = um.rows[0];
         const gk = 'g' + g.id;
         lista.push({
           tipo: 'grupo', ...g,
-          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null } : null,
+          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, plan_hora: u.plan_hora } : null,
           fijado: !!(P[gk] && P[gk].fijado),
           silencio: !!(P[gk] && P[gk].silencio),
           archivado: !!(P[gk] && P[gk].archivado),
@@ -736,6 +739,51 @@ io.on('connection', (socket) => {
     } catch (e) {}
   });
 
+  socket.on('plan-crear', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.grupo || !d.titulo || !d.titulo.trim()) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
+      if (!soy.rowCount) return;
+      const lat = (typeof d.lat === 'number' && typeof d.lng === 'number') ? d.lat : null;
+      const lng = lat != null ? d.lng : null;
+      const ts = Date.now();
+      const titulo = String(d.titulo).trim().slice(0, 60);
+      const hora = String(d.hora || '').slice(0, 20);
+      const r = await pool.query(
+        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,lat,lng,plan,plan_hora) VALUES ($1,$2,'',$3,$4,$5,$6,$7) RETURNING id`,
+        [d.grupo, yo, ts, lat, lng, titulo, hora]);
+      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto: '', ts, lat, lng, plan: titulo, plan_hora: hora, si: 0, no: 0, mivoto: null };
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
+      for (const row of miembros.rows) {
+        sendTo(row.uid, 'grupo-chat', m);
+        if (row.uid !== yo) await crearNotif(row.uid, 'punto', '📍 ' + m.deN + ' propuso un plan: «' + titulo + '»' + (hora ? ' a las ' + hora : ''));
+      }
+    } catch (e) { console.log('plan-crear error', e.message); }
+  });
+
+  socket.on('plan-votar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const m = await pool.query(`SELECT grupo, plan, lat, lng FROM mensajes_grupo WHERE id=$1`, [d.id]);
+      if (!m.rowCount || !m.rows[0].plan) return;
+      const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [m.rows[0].grupo, yo]);
+      if (!soy.rowCount) return;
+      await pool.query(
+        `INSERT INTO plan_votos (msg,uid,voy) VALUES ($1,$2,$3) ON CONFLICT (msg,uid) DO UPDATE SET voy=$3`,
+        [d.id, yo, !!d.voy]);
+      const c = await pool.query(
+        `SELECT COUNT(*) FILTER (WHERE voy)::int AS si, COUNT(*) FILTER (WHERE NOT voy)::int AS no FROM plan_votos WHERE msg=$1`, [d.id]);
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [m.rows[0].grupo]);
+      miembros.rows.forEach(row => sendTo(row.uid, 'plan-votos', { id: d.id, si: c.rows[0].si, no: c.rows[0].no }));
+      if (d.voy && m.rows[0].lat != null) {
+        sendTo(yo, 'punto', { id: 'plan' + d.id, n: m.rows[0].plan, lat: m.rows[0].lat, lng: m.rows[0].lng, ts: Date.now() });
+        socket.emit('aviso', '🚩 El punto del plan ya está en tu mapa');
+      }
+    } catch (e) { console.log('plan-votar error', e.message); }
+  });
+
   socket.on('grupo-crear', async (d) => {
     try {
       const yo = socketDe[socket.id];
@@ -843,12 +891,16 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng
+        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng, mg.plan, mg.plan_hora,
+           (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND v.voy)::int AS si,
+           (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND NOT v.voy)::int AS no,
+           (SELECT voy FROM plan_votos v WHERE v.msg=mg.id AND v.uid=$2) AS mivoto
          FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
-         WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo]);
+         WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 50`, [d.grupo, yo]); 
       socket.emit('grupo-historial', {
         grupo: d.grupo,
         lista: r.rows.reverse().map(x => ({
+          plan: x.plan, plan_hora: x.plan_hora, si: x.si, no: x.no, mivoto: x.mivoto,
           id: x.id, de: x.de, deN: x.den, texto: x.texto, ts: Number(x.ts),
           foto: x.foto, cita: x.cita, audio: x.audio, dur: x.dur, lat: x.lat, lng: x.lng, 
         })),
