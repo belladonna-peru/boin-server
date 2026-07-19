@@ -1586,7 +1586,7 @@ io.on('connection', (socket) => {
   socket.on('negocios', async () => {
     try {
       const r = await pool.query(
-        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng,
+        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng, n.abierto,
            (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos,
            (SELECT ROUND(AVG(estrellas),1) FROM resenas r WHERE r.negocio=n.id)::float AS rating,
            (SELECT COUNT(*) FROM resenas r WHERE r.negocio=n.id)::int AS nresenas
