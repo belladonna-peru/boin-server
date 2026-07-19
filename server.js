@@ -84,6 +84,8 @@ async function initDb() {
     ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS favorito BOOLEAN DEFAULT FALSE;
 ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS restringido BOOLEAN DEFAULT FALSE;
 ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS reaccion TEXT;
+ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS video TEXT;
+ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS video TEXT;
 
     
   `);
@@ -636,21 +638,22 @@ io.on('connection', (socket) => {
       if (!yo || !msg || !msg.para) return;
       const texto = (msg.texto || '').slice(0, 500);
       const foto = (msg.foto && String(msg.foto).startsWith('https://')) ? String(msg.foto).slice(0, 500) : null;
+      const video = (msg.video && String(msg.video).startsWith('https://')) ? String(msg.video).slice(0, 500) : null;
       const audio = (msg.audio && String(msg.audio).startsWith('https://')) ? String(msg.audio).slice(0, 500) : null;
       const dur = audio ? Math.min(Math.round(Number(msg.dur) || 0), 600) : null;
       const cita = msg.cita ? String(msg.cita).slice(0, 140) : null;
       const lat = (typeof msg.lat === 'number' && typeof msg.lng === 'number') ? msg.lat : null;
       const lng = lat != null ? msg.lng : null;
-      if (!texto && !foto && !audio && lat == null) return;
+      if (!texto && !foto && !video && !audio && lat == null) return;
       if (!(await puedenChatear(yo, msg.para))) {
         socket.emit('aviso', 'Primero deben ser patas: envíale una solicitud 🤝');
         return;
       }
       const ts = Date.now();
       const r = await pool.query(
-        `INSERT INTO mensajes (de,para,texto,ts,foto,cita,audio,dur,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-        [yo, msg.para, texto, ts, foto, cita, audio, dur, lat, lng]);
-      const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, cita, audio, dur, lat, lng, leido: false };
+        `INSERT INTO mensajes (de,para,texto,ts,foto,cita,audio,dur,lat,lng,video) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+        [yo, msg.para, texto, ts, foto, cita, audio, dur, lat, lng, video]);
+      const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, video, cita, audio, dur, lat, lng, leido: false };
       sendTo(yo, 'chat', m);
       if (msg.para !== yo) sendTo(msg.para, 'chat', m);
       await avisarEstado(msg.para);
@@ -833,7 +836,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, video, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', {
@@ -1083,20 +1086,20 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.grupo) return;
       const texto = (d.texto || '').trim().slice(0, 500);
       const foto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
+      const video = (d.video && String(d.video).startsWith('https://')) ? String(d.video).slice(0, 500) : null;
       const audio = (d.audio && String(d.audio).startsWith('https://')) ? String(d.audio).slice(0, 500) : null;
       const dur = audio ? Math.min(Math.round(Number(d.dur) || 0), 600) : null;
       const cita = d.cita ? String(d.cita).slice(0, 140) : null;
-      if (!texto && !foto && !audio && d.lat == null) return;
+      if (!texto && !foto && !video && !audio && d.lat == null) return;
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const lat = (typeof d.lat === 'number' && typeof d.lng === 'number') ? d.lat : null;
       const lng = lat != null ? d.lng : null;
-
       const ts = Date.now();
       const r = await pool.query(
-        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,foto,cita,audio,dur,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-        [d.grupo, yo, texto, ts, foto, cita, audio, dur, lat, lng]);
-      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto, ts, foto, cita, audio, dur, lat, lng };
+        `INSERT INTO mensajes_grupo (grupo,de,texto,ts,foto,cita,audio,dur,lat,lng,video) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+        [d.grupo, yo, texto, ts, foto, cita, audio, dur, lat, lng, video]);
+      const m = { id: r.rows[0].id, grupo: d.grupo, de: yo, deN: await nombreDe(yo), texto, ts, foto, video, cita, audio, dur, lat, lng };
       const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [d.grupo]);
       miembros.rows.forEach(row => sendTo(row.uid, 'grupo-chat', m));
     } catch (e) { console.log('grupo-chat error', e.message); }
@@ -1109,7 +1112,7 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng, mg.plan, mg.plan_hora, mg.chancha, mg.chancha_meta,
+        `SELECT mg.id, mg.de, u.n AS den, mg.texto, mg.ts, mg.foto, mg.video, mg.cita, mg.audio, mg.dur, mg.lat, mg.lng, mg.plan, mg.plan_hora, mg.chancha, mg.chancha_meta,
            (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND v.voy)::int AS si,
            (SELECT COUNT(*) FROM plan_votos v WHERE v.msg=mg.id AND NOT v.voy)::int AS no,
            (SELECT voy FROM plan_votos v WHERE v.msg=mg.id AND v.uid=$2) AS mivoto,
@@ -1122,7 +1125,7 @@ io.on('connection', (socket) => {
         grupo: d.grupo,
         lista: r.rows.reverse().map(x => ({
           id: x.id, de: x.de, deN: x.den, texto: x.texto, ts: Number(x.ts),
-          foto: x.foto, cita: x.cita, audio: x.audio, dur: x.dur, lat: x.lat, lng: x.lng,
+          foto: x.foto, cita: x.cita, audio: x.audio,video: x.video, dur: x.dur, lat: x.lat, lng: x.lng,
           plan: x.plan, plan_hora: x.plan_hora, si: x.si, no: x.no, mivoto: x.mivoto,
           chancha: x.chancha, chanchaMeta: x.chancha_meta ? Number(x.chancha_meta) : null,
           chanchaTotal: x.chancha_total, aportantes: x.aportantes, miAporte: x.mi_aporte ? Number(x.mi_aporte) : 0,
