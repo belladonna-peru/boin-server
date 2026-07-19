@@ -79,6 +79,7 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS chancha TEXT;
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS chancha_meta NUMERIC;
     CREATE TABLE IF NOT EXISTS chancha_aportes ( msg INT, uid TEXT, monto NUMERIC, ts BIGINT, PRIMARY KEY (msg, uid) );
+    ALTER TABLE productos ADD COLUMN IF NOT EXISTS foto TEXT;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -143,14 +144,14 @@ async function puedenChatear(a, b) {
 
 async function estadoDe(id) {
   const am = await pool.query(
-    `SELECT u.id, u.n, u.usuario,
+    `SELECT u.id, u.n, u.usuario, u.foto,
             EXISTS(SELECT 1 FROM comparto c WHERE c.de=$1 AND c.con=u.id) AS lecomparto,
             EXISTS(SELECT 1 FROM comparto c2 WHERE c2.de=u.id AND c2.con=$1) AS mecomparte,
             (SELECT COUNT(*) FROM mensajes ms WHERE ms.de=u.id AND ms.para=$1 AND ms.leido=FALSE)::int AS noleidos,
             (SELECT MAX(ms2.ts) FROM mensajes ms2 WHERE (ms2.de=u.id AND ms2.para=$1) OR (ms2.de=$1 AND ms2.para=u.id)) AS ultimo
      FROM amistades a JOIN usuarios u ON u.id=a.b WHERE a.a=$1`, [id]);
   const so = await pool.query(
-    `SELECT s.de, u.n AS den, u.usuario FROM solicitudes s JOIN usuarios u ON u.id=s.de WHERE s.para=$1`, [id]);
+    `SELECT s.de, u.n AS den, u.usuario, u.foto FROM solicitudes s JOIN usuarios u ON u.id=s.de WHERE s.para=$1`, [id]);
   const pe = await pool.query(
     `SELECT DISTINCT cid FROM (
        SELECT CASE WHEN m.de=$1 THEN m.para ELSE m.de END AS cid FROM mensajes m WHERE m.de=$1 OR m.para=$1
@@ -159,13 +160,14 @@ async function estadoDe(id) {
   const extras = [];
   for (const row of pe.rows) {
     const u = await pool.query(
-      `SELECT u.n, u.usuario, u.tipo, ng.nombre AS bizn FROM usuarios u
+      `SELECT u.n, u.usuario, u.tipo, u.foto, ng.nombre AS bizn FROM usuarios u
        LEFT JOIN negocios ng ON ng.id=u.id WHERE u.id=$1`, [row.cid]);
     if (u.rowCount) {
       extras.push({
         id: row.cid,
         n: u.rows[0].bizn || u.rows[0].n,
         usuario: u.rows[0].usuario,
+        foto: u.rows[0].foto,
         online: !!(online[row.cid] && online[row.cid].size),
         leComparto: false,
         biz: u.rows[0].tipo === 'business',
@@ -176,10 +178,10 @@ async function estadoDe(id) {
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, foto: r.foto, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })),
       ...extras,
     ],
-    solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario })),
+    solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario, foto: r.foto })),
   };
 }
 async function avisarEstado(id) { sendTo(id, 'estado', await estadoDe(id)); }
@@ -220,7 +222,7 @@ async function walletDe(yo) {
 async function bizMio(yo) {
   const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [yo]);
   if (!n.rowCount) return { negocio: null, productos: [] };
-  const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
+  const p = await pool.query(`SELECT id, nombre, precio::float, foto FROM productos WHERE negocio=$1 ORDER BY id`, [yo]);
   return { negocio: n.rows[0], productos: p.rows };
 }
 
@@ -326,7 +328,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.id) return;
       const r = await pool.query(
-        `SELECT u.id, u.n FROM likes l JOIN usuarios u ON u.id=l.de WHERE l.momento_id=$1 LIMIT 50`, [d.id]);
+        `SELECT u.id, u.n, u.foto FROM likes l JOIN usuarios u ON u.id=l.de WHERE l.momento_id=$1 LIMIT 50`, [d.id]);
       socket.emit('likes-de', { id: d.id, lista: r.rows });
     } catch (e) {}
   });
@@ -422,7 +424,7 @@ io.on('connection', (socket) => {
       const s = '%' + String(q).toLowerCase().replace('@', '').trim() + '%';
       const digitos = String(q).replace(/\D/g, '');
       const r = await pool.query(
-        `SELECT id, n, usuario, num,
+        `SELECT id, n, usuario, num, foto,
            EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=usuarios.id) AS esamigo,
            EXISTS(SELECT 1 FROM solicitudes so WHERE so.de=$1 AND so.para=usuarios.id) AS pendiente
          FROM usuarios
@@ -433,6 +435,7 @@ io.on('connection', (socket) => {
         id: u.id, n: u.n, usuario: u.usuario,
         num: u.num ? '*** ' + u.num.slice(-3) : '',
         esAmigo: u.esamigo, pendiente: u.pendiente,
+        foto: u.foto,
       })));
     } catch (e) { console.log('buscar error', e.message); }
   });
@@ -1103,10 +1106,10 @@ io.on('connection', (socket) => {
       const soy = await pool.query(`SELECT 1 FROM grupo_miembros WHERE grupo=$1 AND uid=$2`, [d.grupo, yo]);
       if (!soy.rowCount) return;
       const r = await pool.query(
-        `SELECT gm.uid, u.n FROM grupo_miembros gm JOIN usuarios u ON u.id=gm.uid WHERE gm.grupo=$1`, [d.grupo]);
+        `SELECT gm.uid, u.n, u.foto FROM grupo_miembros gm JOIN usuarios u ON u.id=gm.uid WHERE gm.grupo=$1`, [d.grupo]);
       socket.emit('grupo-miembros', {
         grupo: d.grupo,
-        lista: r.rows.map(x => ({ id: x.uid, n: x.n, online: !!(online[x.uid] && online[x.uid].size) })),
+        lista: r.rows.map(x => ({ id: x.uid, n: x.n, foto: x.foto, online: !!(online[x.uid] && online[x.uid].size) })),
       });
     } catch (e) {}
   });
@@ -1136,8 +1139,9 @@ io.on('connection', (socket) => {
       const r = await pool.query(
         `INSERT INTO momentos (de,texto,color,ts,foto,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
         [yo, texto, d.color || 0, ts, foto, lat, lng]);
-      const n = await nombreDe(yo);
-      const m = { id: r.rows[0].id, de: yo, n, texto, color: d.color || 0, ts, foto, lat, lng, likes: 0, coms: 0, meGusta: false };
+      const uq = await pool.query(`SELECT n, foto FROM usuarios WHERE id=$1`, [yo]);
+      const n = uq.rowCount ? uq.rows[0].n : 'Pata';
+      const m = { id: r.rows[0].id, de: yo, n, ufoto: uq.rowCount ? uq.rows[0].foto : null, texto, color: d.color || 0, ts, foto, lat, lng, likes: 0, coms: 0, meGusta: false };
       sendTo(yo, 'momento-nuevo', m);
       const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
       for (const row of ams.rows) {
@@ -1152,14 +1156,14 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo) return;
       const r = await pool.query(
-        `SELECT m.id, m.de, u.n, m.texto, m.color, m.ts, m.foto,
+        `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.color, m.ts, m.foto, 
            (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
            (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
            EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de)
          ORDER BY m.ts DESC LIMIT 30`, [yo]);
-      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
+      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, ufoto: x.ufoto, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
     } catch (e) { console.log('feed error', e.message); }
   });
 
@@ -1169,7 +1173,7 @@ io.on('connection', (socket) => {
       if (!yo) return;
       const hace24h = Date.now() - 24 * 3600 * 1000;
       const r = await pool.query(
-        `SELECT m.id, m.de, u.n, m.texto, m.foto, m.lat, m.lng, m.ts
+        `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.foto, m.lat, m.lng, m.ts
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.lat IS NOT NULL AND m.ts >= $2
            AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
@@ -1184,7 +1188,7 @@ io.on('connection', (socket) => {
       if (!yo) return;
       const hace24h = Date.now() - 24 * 3600 * 1000;
       const r = await pool.query(
-        `SELECT m.id, m.de, u.n, m.texto, m.color, m.foto, m.ts
+        `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.color, m.foto, m.ts
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.ts >= $2
            AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
@@ -1549,9 +1553,9 @@ io.on('connection', (socket) => {
       if (!yo || !d || !d.nombre || !d.precio) return;
       const biz = await pool.query(`SELECT 1 FROM negocios WHERE id=$1`, [yo]);
       if (!biz.rowCount) return;
-      await pool.query(`INSERT INTO productos (negocio,nombre,precio) VALUES ($1,$2,$3)`,
-        [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0)]);
-      socket.emit('biz-mio', await bizMio(yo));
+      const pfoto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
+      await pool.query(`INSERT INTO productos (negocio,nombre,precio,foto) VALUES ($1,$2,$3,$4)`,
+        [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0), pfoto]);    
     } catch (e) { console.log('producto error', e.message); }
   });
 
@@ -1595,7 +1599,7 @@ io.on('connection', (socket) => {
       if (!d || !d.id) return;
       const n = await pool.query(`SELECT * FROM negocios WHERE id=$1`, [d.id]);
       if (!n.rowCount) return;
-      const p = await pool.query(`SELECT id, nombre, precio::float FROM productos WHERE negocio=$1 ORDER BY id`, [d.id]);
+      const p = await pool.query(`SELECT id, nombre, precio::float, foto FROM productos WHERE negocio=$1 ORDER BY id`, [d.id]);
       socket.emit('tienda', { negocio: n.rows[0], productos: p.rows });
     } catch (e) { console.log('tienda error', e.message); }
   });
