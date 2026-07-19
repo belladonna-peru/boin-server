@@ -619,8 +619,8 @@ io.on('connection', (socket) => {
         `INSERT INTO mensajes (de,para,texto,ts,foto,cita,audio,dur,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
         [yo, msg.para, texto, ts, foto, cita, audio, dur, lat, lng]);
       const m = { id: r.rows[0].id, de: yo, para: msg.para, texto, ts, foto, cita, audio, dur, lat, lng, leido: false };
-      sendTo(msg.para, 'chat', m);
       sendTo(yo, 'chat', m);
+      if (msg.para !== yo) sendTo(msg.para, 'chat', m);
       await avisarEstado(msg.para);
     } catch (e) { console.log('chat error', e.message); }
   });
