@@ -81,6 +81,11 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS chancha_aportes ( msg INT, uid TEXT, monto NUMERIC, ts BIGINT, PRIMARY KEY (msg, uid) );
     ALTER TABLE productos ADD COLUMN IF NOT EXISTS foto TEXT;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS visto BIGINT;
+    ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS favorito BOOLEAN DEFAULT FALSE;
+ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS restringido BOOLEAN DEFAULT FALSE;
+ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS reaccion TEXT;
+
+    
   `);
   console.log('Base de datos lista ✅');
 }
@@ -179,7 +184,7 @@ async function estadoDe(id) {
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, foto: r.foto, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, visto: r.visto ? Number(r.visto) : null, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, foto: r.foto, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, visto: r.visto ? Number(r.visto) : null, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })), 
       ...extras,
     ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario, foto: r.foto })),
@@ -720,9 +725,34 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       await pool.query(
-        `INSERT INTO chat_prefs (uid,con,fijado,silencio,archivado) VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (uid,con) DO UPDATE SET fijado=$3, silencio=$4, archivado=$5`,
-        [yo, String(d.con), !!d.fijado, !!d.silencio, !!d.archivado]);
+        `INSERT INTO chat_prefs (uid,con,fijado,silencio,archivado,favorito,restringido) VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (uid,con) DO UPDATE SET fijado=$3, silencio=$4, archivado=$5, favorito=$6, restringido=$7`,
+        [yo, String(d.con), !!d.fijado, !!d.silencio, !!d.archivado, !!d.favorito, !!d.restringido]);
+    } catch (e) {}
+  });
+
+  // ---- reacción a mensaje de grupo ----
+  socket.on('gmsg-reaccion', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      await pool.query(`UPDATE mensajes_grupo SET reaccion=$1 WHERE id=$2`, [d.emoji || null, d.id]);
+      const g = await pool.query(`SELECT grupo FROM mensajes_grupo WHERE id=$1`, [d.id]);
+      if (!g.rows[0]) return;
+      const miembros = await pool.query(`SELECT uid FROM grupo_miembros WHERE grupo=$1`, [g.rows[0].grupo]);
+      miembros.rows.forEach(m => sendTo(m.uid, 'gmsg-reaccion', { id: d.id, emoji: d.emoji || null }));
+    } catch (e) {}
+  });
+
+  // ---- eliminar chat SOLO para mí (el otro no se entera) ----
+  socket.on('chat-eliminar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.con) return;
+      await pool.query(
+        `DELETE FROM mensajes WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)`,
+        [yo, String(d.con)]);
+      sendTo(yo, 'chat-eliminado', { con: String(d.con) });
     } catch (e) {}
   });
 
