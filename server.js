@@ -80,6 +80,7 @@ async function initDb() {
     ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS chancha_meta NUMERIC;
     CREATE TABLE IF NOT EXISTS chancha_aportes ( msg INT, uid TEXT, monto NUMERIC, ts BIGINT, PRIMARY KEY (msg, uid) );
     ALTER TABLE productos ADD COLUMN IF NOT EXISTS foto TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS visto BIGINT;
   `);
   console.log('Base de datos lista ✅');
 }
@@ -144,7 +145,7 @@ async function puedenChatear(a, b) {
 
 async function estadoDe(id) {
   const am = await pool.query(
-    `SELECT u.id, u.n, u.usuario, u.foto,
+    `SELECT u.id, u.n, u.usuario, u.foto, u.visto,
             EXISTS(SELECT 1 FROM comparto c WHERE c.de=$1 AND c.con=u.id) AS lecomparto,
             EXISTS(SELECT 1 FROM comparto c2 WHERE c2.de=u.id AND c2.con=$1) AS mecomparte,
             (SELECT COUNT(*) FROM mensajes ms WHERE ms.de=u.id AND ms.para=$1 AND ms.leido=FALSE)::int AS noleidos,
@@ -178,7 +179,7 @@ async function estadoDe(id) {
   }
   return {
     amigos: [
-      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, foto: r.foto, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })),
+      ...am.rows.map(r => ({ id: r.id, n: r.n, usuario: r.usuario, foto: r.foto, online: !!(online[r.id] && online[r.id].size), leComparto: r.lecomparto, meComparte: r.mecomparte, visto: r.visto ? Number(r.visto) : null, noLeidos: r.noleidos, ultimo: r.ultimo ? Number(r.ultimo) : 0, })),
       ...extras,
     ],
     solicitudes: so.rows.map(r => ({ de: r.de, deN: r.den, usuario: r.usuario, foto: r.foto })),
@@ -1763,6 +1764,7 @@ io.on('connection', (socket) => {
     delete socketDe[socket.id];
     if (yo && online[yo]) {
       online[yo].delete(socket.id);
+      if (!online[yo].size) pool.query(`UPDATE usuarios SET visto=$2 WHERE id=$1`, [yo, Date.now()]).catch(() => {});
       try { await avisarAmigos(yo); } catch (e) {}
     }
   });
