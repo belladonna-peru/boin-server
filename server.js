@@ -650,17 +650,17 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo) return;
       const est = await estadoDe(yo);
-      const prefs = await pool.query(`SELECT con, fijado, silencio FROM chat_prefs WHERE uid=$1`, [yo]);
+      const prefs = await pool.query(`SELECT con, fijado, silencio, archivado FROM chat_prefs WHERE uid=$1`, [yo]);
       const P = {}; prefs.rows.forEach(x => { P[x.con] = x; });
       const lista = [];
       for (const a of (est.amigos || [])) {
         const um = await pool.query(
-          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, leido, mg.plan , mg.plan_hora FROM mensajes
+          `SELECT de, texto, foto, audio, dur, plata, ts, lat, lng, cobro, cobrado, leido FROM mensajes
            WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1) ORDER BY ts DESC LIMIT 1`, [yo, a.id]);
         const u = um.rows[0];
         lista.push({
           tipo: 'amigo', ...a,
-          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, chancha: u.chancha, chancha_meta: u.chancha_meta,   plan_hora: u.plan_hora } : null,
+          ultimoMsg: u ? { de: u.de, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, plata: u.plata ? Number(u.plata) : null, ts: Number(u.ts), leido: u.leido, lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, cobrado: u.cobrado } : null,
           fijado: !!(P[a.id] && P[a.id].fijado),
           silencio: !!(P[a.id] && P[a.id].silencio),
           archivado: !!(P[a.id] && P[a.id].archivado),
@@ -669,14 +669,14 @@ io.on('connection', (socket) => {
       const gs = await gruposDe(yo);
       for (const g of (gs || [])) {
         const um = await pool.query(
-          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.cobro, mg.plan, mg.chancha, mg.chancha_meta, mg.plan_hora
+          `SELECT mg.de, u.n AS den, mg.texto, mg.foto, mg.audio, mg.dur, mg.ts, mg.lat, mg.lng, mg.plan, mg.plan_hora, mg.chancha
            FROM mensajes_grupo mg LEFT JOIN usuarios u ON u.id=mg.de
            WHERE mg.grupo=$1 ORDER BY mg.ts DESC LIMIT 1`, [g.id]);
         const u = um.rows[0];
         const gk = 'g' + g.id;
         lista.push({
           tipo: 'grupo', ...g,
-          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, cobro: u.cobro ? Number(u.cobro) : null, plan: u.plan, chancha: u.chancha, chancha_meta: u.chancha_meta, plan_hora: u.plan_hora } : null,
+          ultimoMsg: u ? { de: u.de, deN: u.den, texto: u.texto, foto: u.foto, audio: u.audio, dur: u.dur, ts: Number(u.ts), lat: u.lat, lng: u.lng, plan: u.plan, plan_hora: u.plan_hora, chancha: u.chancha } : null,
           fijado: !!(P[gk] && P[gk].fijado),
           silencio: !!(P[gk] && P[gk].silencio),
           archivado: !!(P[gk] && P[gk].archivado),
@@ -776,7 +776,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', {
@@ -1555,7 +1555,8 @@ io.on('connection', (socket) => {
       if (!biz.rowCount) return;
       const pfoto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
       await pool.query(`INSERT INTO productos (negocio,nombre,precio,foto) VALUES ($1,$2,$3,$4)`,
-        [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0), pfoto]);    
+        [yo, String(d.nombre).slice(0, 40), Math.max(0, Number(d.precio) || 0), pfoto]);   
+        socket.emit('biz-mio', await bizMio(yo)); 
     } catch (e) { console.log('producto error', e.message); }
   });
 
@@ -1734,10 +1735,11 @@ io.on('connection', (socket) => {
   socket.on('negocios-mapa', async () => {
     try {
       const r = await pool.query(
-        `(SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos,
+        `SELECT n.id, n.nombre, n.descr, n.cat, n.lat, n.lng, n.abierto,
+           (SELECT COUNT(*) FROM productos p WHERE p.negocio=n.id)::int AS productos,
            (SELECT ROUND(AVG(estrellas),1) FROM resenas r WHERE r.negocio=n.id)::float AS rating,
            (SELECT COUNT(*) FROM resenas r WHERE r.negocio=n.id)::int AS nresenas
-         FROM negocios n ORDER BY n.nombre ASC WHERE n.lat IS NOT NULL`);
+         FROM negocios n WHERE n.lat IS NOT NULL ORDER BY n.nombre ASC`);
       socket.emit('negocios-mapa', r.rows.map(x => ({ ...x, abierto: x.abierto !== false, online: !!(online[x.id] && online[x.id].size) })));
     } catch (e) { console.log('negocios-mapa error', e.message); }
   });
