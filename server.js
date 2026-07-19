@@ -304,6 +304,32 @@ io.on('connection', (socket) => {
       socket.emit('aviso', '⚡ ¡Boin enviado! ' + (await nombreDe(d.para)) + ' sabe que vas en camino');
     } catch (e) { console.log('boinear error', e.message); }
   });
+
+  // ---- contenido de las pestañas del perfil ----
+  socket.on('perfil-tab', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.tab) return;
+      let items = [];
+      if (d.tab === 'momentos') {
+        const r = await pool.query(`SELECT id, foto, texto, ts FROM momentos WHERE de=$1 ORDER BY ts DESC`, [yo]);
+        items = r.rows;
+      } else if (d.tab === 'guardados') {
+        const r = await pool.query(`SELECT m.id, m.foto, m.texto, m.ts FROM guardados g JOIN momentos m ON m.id=g.momento WHERE g.uid=$1 ORDER BY g.ts DESC`, [yo]);
+        items = r.rows;
+      } else if (d.tab === 'gustas') {
+        const r = await pool.query(`SELECT m.id, m.foto, m.texto, m.ts FROM likes l JOIN momentos m ON m.id=l.momento_id WHERE l.de=$1 ORDER BY m.ts DESC`, [yo]);
+        items = r.rows;
+      } else if (d.tab === 'compartidos') {
+        const r = await pool.query(`SELECT id, foto, texto, ts FROM momentos WHERE de=$1 AND op1 IS NOT NULL ORDER BY ts DESC`, [yo]);
+        items = r.rows;
+      } else if (d.tab === 'destacados') {
+        const r = await pool.query(`SELECT id, foto, nombre, precio FROM productos WHERE negocio=$1 AND foto IS NOT NULL ORDER BY id DESC`, [yo]);
+        items = r.rows.map(x => ({ id: x.id, foto: x.foto, texto: x.nombre, precio: x.precio }));
+      }
+      socket.emit('perfil-tab', { tab: d.tab, items });
+    } catch (e) {}
+  });
   // ---- guardar / quitar de guardados ----
   socket.on('guardar', async (d) => {
     try {
