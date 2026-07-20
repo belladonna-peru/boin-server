@@ -86,6 +86,7 @@ ALTER TABLE chat_prefs ADD COLUMN IF NOT EXISTS restringido BOOLEAN DEFAULT FALS
 ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS reaccion TEXT;
 ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS video TEXT;
 ALTER TABLE mensajes_grupo ADD COLUMN IF NOT EXISTS video TEXT;
+ALTER TABLE momentos ADD COLUMN IF NOT EXISTS historia BOOLEAN DEFAULT TRUE;
 
     
   `);
@@ -1196,9 +1197,10 @@ io.on('connection', (socket) => {
       const lat = (typeof d.lat === 'number') ? d.lat : null;
       const lng = (typeof d.lng === 'number') ? d.lng : null;
       const ts = Date.now();
+      const enHistoria = d.historia !== false;
       const r = await pool.query(
-        `INSERT INTO momentos (de,texto,color,ts,foto,lat,lng) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-        [yo, texto, d.color || 0, ts, foto, lat, lng]);
+        `INSERT INTO momentos (de,texto,color,ts,foto,lat,lng,fotos,historia) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+[yo, texto, d.color || 0, ts, fotoFinal, lat, lng, fotosJson, enHistoria]);
       const uq = await pool.query(`SELECT n, foto FROM usuarios WHERE id=$1`, [yo]);
       const n = uq.rowCount ? uq.rows[0].n : 'Pata';
       const m = { id: r.rows[0].id, de: yo, n, ufoto: uq.rowCount ? uq.rows[0].foto : null, texto, color: d.color || 0, ts, foto, lat, lng, likes: 0, coms: 0, meGusta: false };
@@ -1251,6 +1253,7 @@ io.on('connection', (socket) => {
         `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.color, m.foto, m.ts
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.ts >= $2
+           AND m.historia = TRUE
            AND (m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de))
          ORDER BY m.ts ASC LIMIT 100`, [yo, hace24h]);
       socket.emit('historias', r.rows.map(x => ({ ...x, ts: Number(x.ts) })));
