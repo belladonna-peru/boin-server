@@ -1191,6 +1191,7 @@ io.on('connection', (socket) => {
 
   socket.on('momento-publicar', async (d) => {
     try {
+      console.log('📸 PUBLICAR → fotos recibidas:', (d.fotos || []).length, '| foto:', !!d.foto);
       const yo = socketDe[socket.id];
       if (!yo || !d) return;
       const texto = (d.texto || '').trim().slice(0, 200);
