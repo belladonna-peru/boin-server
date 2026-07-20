@@ -837,7 +837,7 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d || !d.con) return;
       const r = await pool.query(
-        `SELECT id, de, para, texto, ts, foto, video, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes
+        `SELECT id, de, para, texto, ts, foto, video, cita, leido, reaccion, audio, dur, plata, editado, lat, lng, cobro, cobrado FROM mensajes
          WHERE (de=$1 AND para=$2) OR (de=$2 AND para=$1)
          ORDER BY ts DESC LIMIT 50`, [yo, d.con]);
       socket.emit('historial', {
@@ -1192,18 +1192,21 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo || !d) return;
       const texto = (d.texto || '').trim().slice(0, 200);
+      const fotosArr = Array.isArray(d.fotos) ? d.fotos.filter(u => String(u).startsWith('https://')).slice(0, 10) : [];
       const foto = (d.foto && String(d.foto).startsWith('https://')) ? String(d.foto).slice(0, 500) : null;
-      if (!texto && !foto) return;
+      const fotoFinal = foto || fotosArr[0] || null;
+      const fotosJson = fotosArr.length > 1 ? JSON.stringify(fotosArr) : null;
+      if (!texto && !fotoFinal) return;
       const lat = (typeof d.lat === 'number') ? d.lat : null;
       const lng = (typeof d.lng === 'number') ? d.lng : null;
       const ts = Date.now();
       const enHistoria = d.historia !== false;
       const r = await pool.query(
         `INSERT INTO momentos (de,texto,color,ts,foto,lat,lng,fotos,historia) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-[yo, texto, d.color || 0, ts, fotoFinal, lat, lng, fotosJson, enHistoria]);
+        [yo, texto, d.color || 0, ts, fotoFinal, lat, lng, fotosJson, enHistoria]);
       const uq = await pool.query(`SELECT n, foto FROM usuarios WHERE id=$1`, [yo]);
       const n = uq.rowCount ? uq.rows[0].n : 'Pata';
-      const m = { id: r.rows[0].id, de: yo, n, ufoto: uq.rowCount ? uq.rows[0].foto : null, texto, color: d.color || 0, ts, foto, lat, lng, likes: 0, coms: 0, meGusta: false };
+      const m = { id: r.rows[0].id, de: yo, n, ufoto: uq.rowCount ? uq.rows[0].foto : null, texto, color: d.color || 0, ts, foto: fotoFinal, fotos: fotosArr.length > 1 ? fotosArr : null, lat, lng, likes: 0, coms: 0, meGusta: false };
       sendTo(yo, 'momento-nuevo', m);
       const ams = await pool.query(`SELECT b FROM amistades WHERE a=$1`, [yo]);
       for (const row of ams.rows) {
@@ -1218,14 +1221,18 @@ io.on('connection', (socket) => {
       const yo = socketDe[socket.id];
       if (!yo) return;
       const r = await pool.query(
-        `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.color, m.ts, m.foto, 
+        `SELECT m.id, m.de, u.n, u.foto AS ufoto, m.texto, m.color, m.ts, m.foto, m.fotos, m.lat, m.lng,
            (SELECT COUNT(*) FROM likes l WHERE l.momento_id=m.id)::int AS likes,
            (SELECT COUNT(*) FROM comentarios c WHERE c.momento_id=m.id)::int AS coms,
            EXISTS(SELECT 1 FROM likes l WHERE l.momento_id=m.id AND l.de=$1) AS megusta
          FROM momentos m JOIN usuarios u ON u.id=m.de
          WHERE m.de=$1 OR EXISTS(SELECT 1 FROM amistades a WHERE a.a=$1 AND a.b=m.de)
          ORDER BY m.ts DESC LIMIT 30`, [yo]);
-      socket.emit('feed', r.rows.map(x => ({ id: x.id, de: x.de, n: x.n, ufoto: x.ufoto, texto: x.texto, color: x.color, ts: Number(x.ts), foto: x.foto, likes: x.likes, coms: x.coms, meGusta: x.megusta })));
+      socket.emit('feed', r.rows.map(x => ({
+        id: x.id, de: x.de, n: x.n, ufoto: x.ufoto, texto: x.texto, color: x.color, ts: Number(x.ts),
+        foto: x.foto, fotos: x.fotos ? JSON.parse(x.fotos) : null, lat: x.lat, lng: x.lng,
+        likes: x.likes, coms: x.coms, meGusta: x.megusta,
+      })));
     } catch (e) { console.log('feed error', e.message); }
   });
 
