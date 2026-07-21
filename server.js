@@ -1302,6 +1302,17 @@ io.on('connection', (socket) => {
     } catch (e) { console.log('borrar error', e.message); }
   });
 
+  socket.on('momento-editar', async (d) => {
+    try {
+      const yo = socketDe[socket.id];
+      if (!yo || !d || !d.id) return;
+      const own = await pool.query(`SELECT de FROM momentos WHERE id=$1`, [d.id]);
+      if (!own.rowCount || own.rows[0].de !== yo) return;
+      await pool.query(`UPDATE momentos SET texto=$2 WHERE id=$1`, [d.id, String(d.texto || '').slice(0, 200)]);
+      socket.emit('aviso', '✏️ Historia actualizada');
+    } catch (e) {}
+  });
+
   socket.on('comentarios', async (d) => {
     try {
       const yo = socketDe[socket.id];
